@@ -1,0 +1,8 @@
+# python sources
+*.py    text diff=python
+
+# documents
+*.md    text diff=markdown
+
+# serialization
+*.toml  text
