@@ -1,0 +1,5 @@
+[submodule "extern/typeshed"]
+	path = extern/typeshed
+	url = https://github.com/python/typeshed
+	ignore = untracked
+	shallow = true
