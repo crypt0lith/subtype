@@ -1,8 +1,10 @@
 import abc
 import annotationlib
+import ast
 import functools as ft
 import types
 import typing as tp
+from collections import ChainMap
 
 _RECURSION_LIMIT = 16
 _TypeParameter: tp.TypeAlias = tp.TypeVar | tp.TypeVarTuple | tp.ParamSpec
@@ -169,11 +171,64 @@ class _literal_subclasscheck(_checker_descriptor):
         )
 
 
+class _ForwardRefSubscriptTransformer(ast.NodeTransformer):
+    def __init__(self, **kwargs):
+        self._ns = types.MappingProxyType(
+            ChainMap(
+                kwargs.get("locals") or {}, kwargs.get("globals") or {}, __builtins__
+            )
+        )
+
+    def visit_Subscript(self, node):
+        self.generic_visit(node)
+        # types like slice, zip, and dict_items are subscriptable in
+        # annotations, but do not define __class_getitem__ at runtime.
+        if (
+            isinstance(node.value, ast.Name)
+            and node.value.id in self._ns
+            and not hasattr(self._ns[node.value.id], "__class_getitem__")
+        ):
+            # emit only the subscripted name
+            return node.value
+        return node
+
+    @classmethod
+    def evaluate_forwardref(cls, forwardref: tp.ForwardRef, **kwargs):
+        if "globals" not in kwargs:
+            kwargs["globals"] = forwardref.__globals__
+        if not ("locals" in kwargs or forwardref.__cell__ is None):
+            kwargs["locals"] = getattr(
+                forwardref.__cell__.get("__classdict__"), "cell_contents", None
+            )
+        if forwardref.__extra_names__:
+            kwargs["locals"] = (kwargs.get("locals") or {}) | forwardref.__extra_names__
+        tree = ast.fix_missing_locations(
+            cls(**kwargs).visit(ast.Expression(forwardref.__ast_node__))
+        )
+        code = compile(tree, "<ast>", "eval")
+        return eval(code, kwargs.get("globals"), kwargs.get("locals"))
+
+
+@ft.cache
+def _builtins():
+    import _collections_abc
+    import builtins
+
+    abc_, builtins_ = map(vars, [_collections_abc, builtins])
+    out = {
+        k: v
+        for k, v in map(
+            lambda k, d=(abc_ | builtins_): (k, d[k]), abc_.keys() ^ builtins_.keys()
+        )
+        if not isinstance(v, types.ModuleType)
+        if callable(v) or not k.startswith("_")
+    }
+    return types.MappingProxyType(out)
+
+
 @ft.cache
 def _builtin_overloads() -> types.MappingProxyType[str, tuple[types.FunctionType, ...]]:
-    import ast
-
-    class TypeAliasTransformer(ast.NodeTransformer):
+    class TypeAliasTransformer(_ForwardRefSubscriptTransformer):
         def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.stmt:
             # check if this is a self-referential TypeAlias
             if (
@@ -197,21 +252,8 @@ def _builtin_overloads() -> types.MappingProxyType[str, tuple[types.FunctionType
             return node
 
     class OverloadCollector(TypeAliasTransformer):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            import _collections_abc
-            import builtins
-
-            abc_, builtins_ = map(vars, [_collections_abc, builtins])
-            self.builtins = {
-                k: v
-                for k, v in map(
-                    lambda k, d=(abc_ | builtins_): (k, d[k]),
-                    abc_.keys() ^ builtins_.keys(),
-                )
-                if not isinstance(v, types.ModuleType)
-                if callable(v) or not k.startswith("_")
-            }
+        def __init__(self):
+            super().__init__(globals=_builtins())
             self.overloads = None
 
         def collect(self, node, _globals=None, /):
@@ -241,7 +283,7 @@ def _builtin_overloads() -> types.MappingProxyType[str, tuple[types.FunctionType
                     s.orelse = self._body(s.orelse, depth) if s.orelse else []
                     out.append(s)
                 elif isinstance(s, ast.ClassDef):
-                    if s.name in self.builtins:
+                    if s.name in self._ns:
                         s.bases, s.keywords, s.decorator_list = [], [], []
                         s.body = self._body(s.body, depth + 1)
                         out += [s, ast.Delete([ast.Name(s.name, ast.Del())])]
@@ -255,7 +297,7 @@ def _builtin_overloads() -> types.MappingProxyType[str, tuple[types.FunctionType
                         ]
                         out.append(s)
                 elif isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    if depth or s.name in self.builtins:
+                    if depth or s.name in self._ns:
                         is_prop = False
                         for d in s.decorator_list:
                             if isinstance(d, ast.Name) and d.id in {
@@ -285,19 +327,6 @@ def _builtin_overloads() -> types.MappingProxyType[str, tuple[types.FunctionType
 
         def visit_Module(self, node: ast.Module) -> ast.Module:
             node.body = self._body(node.body)
-            return node
-
-        def visit_Subscript(self, node: ast.Subscript) -> ast.expr:
-            self.generic_visit(node)
-            # types like slice, zip, and dict_items are subscriptable in
-            # annotations, but do not define __class_getitem__ at runtime.
-            if (
-                isinstance(node.value, ast.Name)
-                and node.value.id in self.builtins
-                and not hasattr(self.builtins[node.value.id], "__class_getitem__")
-            ):
-                # emit only the subscripted name
-                return node.value
             return node
 
     import sys
