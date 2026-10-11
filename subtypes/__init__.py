@@ -1,10 +1,10 @@
 import abc
 import annotationlib
 import ast
+import builtins
 import functools as ft
 import types
 import typing as tp
-from collections import ChainMap
 
 _RECURSION_LIMIT = 16
 _TypeParameter: tp.TypeAlias = tp.TypeVar | tp.TypeVarTuple | tp.ParamSpec
@@ -124,6 +124,8 @@ def _make_typevars_bound(
             args = tp.get_args(typx)
         if hasattr(typx, "copy_with"):
             copy_with = typx.copy_with
+        elif not hasattr(origin, "__class_getitem__"):
+            return origin
         else:
             copy_with = origin.__class_getitem__
         new_args = []
@@ -172,11 +174,14 @@ class _literal_subclasscheck(_checker_descriptor):
 
 
 class _ForwardRefSubscriptTransformer(ast.NodeTransformer):
-    def __init__(self, **kwargs):
+    def __init__(
+        self,
+        *,
+        globals: tp.Mapping[str, tp.Any] | None = None,
+        locals: tp.Mapping[str, tp.Any] | None = None,
+    ):
         self._ns = types.MappingProxyType(
-            ChainMap(
-                kwargs.get("locals") or {}, kwargs.get("globals") or {}, __builtins__
-            )
+            {**builtins.__dict__, **(globals or {}), **(locals or {})}
         )
 
     def visit_Subscript(self, node):
@@ -193,32 +198,47 @@ class _ForwardRefSubscriptTransformer(ast.NodeTransformer):
         return node
 
     @classmethod
-    def evaluate_forwardref(cls, forwardref: tp.ForwardRef, **kwargs):
-        if "globals" not in kwargs:
-            kwargs["globals"] = forwardref.__globals__
-        if not ("locals" in kwargs or forwardref.__cell__ is None):
-            kwargs["locals"] = getattr(
-                forwardref.__cell__.get("__classdict__"), "cell_contents", None
-            )
+    def evaluate_forwardref(
+        cls,
+        forwardref: tp.ForwardRef,
+        *,
+        globals: dict[str, tp.Any] | None = None,
+        locals: tp.Mapping[str, tp.Any] | None = None,
+    ):
+        if globals is None:
+            globals = forwardref.__globals__
+        if locals is None:
+            locals = {}
+        else:
+            locals = dict(locals)
+        if isinstance(forwardref.__cell__, dict):
+            for cell_name, cell in forwardref.__cell__.items():
+                try:
+                    cell_value = cell.cell_contents
+                except ValueError:
+                    pass
+                else:
+                    locals.setdefault(cell_name, cell_value)
         if forwardref.__extra_names__:
-            kwargs["locals"] = (kwargs.get("locals") or {}) | forwardref.__extra_names__
+            locals.update(forwardref.__extra_names__)
         tree = ast.fix_missing_locations(
-            cls(**kwargs).visit(ast.Expression(forwardref.__ast_node__))
+            cls(globals=globals, locals=locals).visit(
+                ast.Expression(forwardref.__ast_node__)
+            )
         )
         code = compile(tree, "<ast>", "eval")
-        return eval(code, kwargs.get("globals"), kwargs.get("locals"))
+        return eval(code, globals, locals)
 
 
 @ft.cache
-def _builtins():
+def _builtin_callables():
     import _collections_abc
-    import builtins
 
-    abc_, builtins_ = map(vars, [_collections_abc, builtins])
     out = {
         k: v
         for k, v in map(
-            lambda k, d=(abc_ | builtins_): (k, d[k]), abc_.keys() ^ builtins_.keys()
+            lambda k, d=(_collections_abc.__dict__ | builtins.__dict__): (k, d[k]),
+            _collections_abc.__dict__.keys() ^ builtins.__dict__.keys(),
         )
         if not isinstance(v, types.ModuleType)
         if callable(v) or not k.startswith("_")
@@ -253,7 +273,7 @@ def _builtin_overloads() -> types.MappingProxyType[str, tuple[types.FunctionType
 
     class OverloadCollector(TypeAliasTransformer):
         def __init__(self):
-            super().__init__(globals=_builtins())
+            super().__init__(globals=_builtin_callables())
             self.overloads = None
 
         def collect(self, node, _globals=None, /):
