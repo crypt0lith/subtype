@@ -1,5 +1,6 @@
 import abc
 import annotationlib
+import functools as ft
 import types
 import typing as tp
 
@@ -166,3 +167,173 @@ class _literal_subclasscheck(_checker_descriptor):
         return tp.get_origin(obj) is tp.Literal and set(tp.get_args(obj)).issubset(
             self.__args__
         )
+
+
+@ft.cache
+def _builtin_overloads() -> types.MappingProxyType[str, tuple[types.FunctionType, ...]]:
+    import ast
+
+    class TypeAliasTransformer(ast.NodeTransformer):
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.stmt:
+            # check if this is a self-referential TypeAlias
+            if (
+                isinstance(node.target, ast.Name)
+                and isinstance(node.annotation, ast.Name)
+                and node.annotation.id == "TypeAlias"
+                and node.value is not None
+                and any(
+                    isinstance(n, ast.Name) and n.id == node.target.id
+                    for n in ast.walk(node.value)
+                )
+            ):
+                # convert to PEP 695 type statement to lazily evaluate
+                # the self-reference.
+                return ast.copy_location(
+                    ast.TypeAlias(
+                        ast.Name(node.target.id, ast.Store()), [], node.value
+                    ),
+                    node,
+                )
+            return node
+
+    class OverloadCollector(TypeAliasTransformer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            import _collections_abc
+            import builtins
+
+            abc_, builtins_ = map(vars, [_collections_abc, builtins])
+            self.builtins = {
+                k: v
+                for k, v in map(
+                    lambda k, d=(abc_ | builtins_): (k, d[k]),
+                    abc_.keys() ^ builtins_.keys(),
+                )
+                if not isinstance(v, types.ModuleType)
+                if callable(v) or not k.startswith("_")
+            }
+            self.overloads = None
+
+        def collect(self, node, _globals=None, /):
+            res = ast.fix_missing_locations(self.visit(node))
+            prev = tp._overload_registry
+            try:
+                self.overloads = tp._overload_registry.__class__(
+                    tp._overload_registry.default_factory
+                )
+                tp._overload_registry = self.overloads
+                exec(compile(res, "<ast>", "exec", dont_inherit=True), _globals or {})
+            finally:
+                tp._overload_registry = prev
+            return self.overloads
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.ImportFrom:
+            if node.module == "typing":
+                # type_check_only does not exist at runtime
+                node.names = [a for a in node.names if a.name != "type_check_only"]
+            return node
+
+        def _body(self, body: list[ast.stmt], depth: int = 0) -> list[ast.stmt]:
+            out: list[ast.stmt] = []
+            for s in body:
+                if isinstance(s, ast.If):
+                    s.body = self._body(s.body, depth)
+                    s.orelse = self._body(s.orelse, depth) if s.orelse else []
+                    out.append(s)
+                elif isinstance(s, ast.ClassDef):
+                    if s.name in self.builtins:
+                        s.bases, s.keywords, s.decorator_list = [], [], []
+                        s.body = self._body(s.body, depth + 1)
+                        out += [s, ast.Delete([ast.Name(s.name, ast.Del())])]
+                    else:
+                        s.decorator_list = [
+                            d
+                            for d in s.decorator_list
+                            if not (
+                                isinstance(d, ast.Name) and d.id == "type_check_only"
+                            )
+                        ]
+                        out.append(s)
+                elif isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if depth or s.name in self.builtins:
+                        is_prop = False
+                        for d in s.decorator_list:
+                            if isinstance(d, ast.Name) and d.id in {
+                                "property",
+                                "overload",
+                            }:
+                                is_prop = d.id == "property"
+                                break
+                            if (
+                                isinstance(d, ast.Attribute)
+                                and getattr(d.value, "id", None) == s.name
+                            ):
+                                is_prop = True
+                                break
+                        else:
+                            s.decorator_list.append(ast.Name("overload", ast.Load()))
+                        if not is_prop:
+                            self.generic_visit(s)
+                        out.append(s)
+                        if not depth:
+                            out.append(ast.Delete([ast.Name(s.name, ast.Del())]))
+                    else:
+                        out.append(s)
+                elif not depth:
+                    out.append(self.visit(s))
+            return out or [ast.Pass()]
+
+        def visit_Module(self, node: ast.Module) -> ast.Module:
+            node.body = self._body(node.body)
+            return node
+
+        def visit_Subscript(self, node: ast.Subscript) -> ast.expr:
+            self.generic_visit(node)
+            # types like slice, zip, and dict_items are subscriptable in
+            # annotations, but do not define __class_getitem__ at runtime.
+            if (
+                isinstance(node.value, ast.Name)
+                and node.value.id in self.builtins
+                and not hasattr(self.builtins[node.value.id], "__class_getitem__")
+            ):
+                # emit only the subscripted name
+                return node.value
+            return node
+
+    import sys
+    from importlib.machinery import SourceFileLoader
+    from importlib.resources import as_file, files
+    from importlib.util import module_from_spec, spec_from_loader
+
+    class PyiLoader(SourceFileLoader):
+        def source_to_code(self, data, path, *, _optimize=-1):
+            tree = TypeAliasTransformer().visit(ast.parse(data, path))
+            return compile(
+                ast.fix_missing_locations(tree), path, "exec", dont_inherit=True
+            )
+
+        def path_stats(self, path):
+            st = super().path_stats(path)
+            from os import stat
+
+            return {**st, "mtime": max(st["mtime"], stat(__file__).st_mtime)}
+
+    STUBS = files(__name__) / "_stubs"
+    with as_file(STUBS / "_typeshed" / "__init__.pyi") as path:
+        spec = spec_from_loader(
+            "_typeshed", PyiLoader("_typeshed", str(path)), is_package=True
+        )
+        assert spec is not None
+        assert spec.loader is not None
+        sys.modules["_typeshed"] = mod = module_from_spec(spec)
+        try:
+            spec.loader.exec_module(mod)
+            out = OverloadCollector().collect(
+                ast.parse((STUBS / "builtins.pyi").read_bytes()),
+                {"__name__": "builtins"},
+            )
+        finally:
+            del sys.modules["_typeshed"]
+    return types.MappingProxyType(
+        {qualname: tuple(ovs.values()) for qualname, ovs in out["builtins"].items()}
+    )
