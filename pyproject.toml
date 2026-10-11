@@ -19,6 +19,7 @@ include = ["subtypes*"]
 preview = true
 skip-magic-trailing-comma = true
 target-version = ["py314"]
+extend-exclude = "^/subtypes/_stubs/"
 
 [tool.isort]
 profile = "black"
