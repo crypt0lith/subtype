@@ -19,12 +19,16 @@ def _is_indeterminate_tuple(tup: type[tuple], /):
     )
 
 
+def _is_unpacked(typx, /) -> bool:
+    return getattr(typx, "__unpacked__", False)
+
+
 def _unpack_tuple_items(typx, /) -> tuple[tp.Any, ...]:
     if tp.get_origin(typx) is tp.Unpack and not tp.is_typeddict(
         tup := tp.get_args(typx)[0]
     ):
         typx = tup
-    if getattr(typx, "__unpacked__", False) and not _is_indeterminate_tuple(typx):
+    if _is_unpacked(typx) and not _is_indeterminate_tuple(typx):
         return tp.get_args(typx)
     return (typx,)
 
@@ -39,7 +43,7 @@ def _get_tuple_arg_indices(
         (
             i
             for i, x in enumerate(args)
-            if getattr(x, "__unpacked__", False) and _is_indeterminate_tuple(x)
+            if _is_unpacked(x) and _is_indeterminate_tuple(x)
         ),
         None,
     )
@@ -103,7 +107,7 @@ def _make_typevars_bound(
             return typx
     if recursion_count > _RECURSION_LIMIT:
         return object
-    unpacked = getattr(typx, "__unpacked__", False)
+    unpacked = _is_unpacked(typx)
     if args := tp.get_args(typx):
         type_params = _get_dst_params(typx) | type_params
         origin = tp.get_origin(typx) or typx
@@ -129,11 +133,7 @@ def _make_typevars_bound(
             new_args.extend(_unpack_tuple_items(new_arg))
         typx = copy_with(tuple(new_args))
         # handle *tuple[...] star-unpack form
-        if (
-            unpacked
-            and type(typx) is types.GenericAlias
-            and not getattr(typx, "__unpacked__", False)
-        ):
+        if unpacked and type(typx) is types.GenericAlias and not _is_unpacked(typx):
             typx = next(iter(typx))
     return typx
 
