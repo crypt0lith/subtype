@@ -148,25 +148,20 @@ class _SupportsGeneric[T = type[tp.Any]](tp.Protocol):
     __args__: tuple[object, ...]
 
 
-class _checker_descriptor(abc.ABC):
+class _checker(abc.ABC):
     def __init__(self, typx: _SupportsGeneric, /):
         self.__args__ = typx.__args__
-
-    def __get__(self, inst, owner=None, /):
-        if inst is None:
-            return self
-        return self.__call__
 
     @abc.abstractmethod
     def __call__(self, obj: tp.Any, /) -> bool: ...
 
 
-class _literal_instancecheck(_checker_descriptor):
+class _literal_instancecheck(_checker):
     def __call__(self, obj, /):
         return obj in self.__args__
 
 
-class _literal_subclasscheck(_checker_descriptor):
+class _literal_subclasscheck(_checker):
     def __call__(self, obj, /):
         return tp.get_origin(obj) is tp.Literal and set(tp.get_args(obj)).issubset(
             self.__args__
