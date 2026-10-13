@@ -7,6 +7,7 @@ import inspect
 import sys
 import types
 import typing as tp
+import weakref
 
 _RECURSION_LIMIT = 16
 _TypeParameter: tp.TypeAlias = tp.TypeVar | tp.TypeVarTuple | tp.ParamSpec
@@ -160,14 +161,33 @@ class _checker(abc.ABC):
 
 class _literal_instancecheck(_checker):
     def __call__(self, obj, /):
-        return obj in self.__args__
+        # Literal[1] excludes True
+        return any(type(obj) is type(a) and obj == a for a in self.__args__)
 
 
-class _literal_subclasscheck(_checker):
+class _literal_subclasscheck(_literal_instancecheck):
     def __call__(self, obj, /):
-        return tp.get_origin(obj) is tp.Literal and set(tp.get_args(obj)).issubset(
-            self.__args__
+        return tp.get_origin(obj) is tp.Literal and all(
+            map(super().__call__, tp.get_args(obj))
         )
+
+
+_PROMOTIONS = {float: (float, int), complex: (complex, float, int)}
+
+
+class _nominal_instancecheck(_checker):
+    def __init__(self, cls: type, /):
+        self.__args__ = _PROMOTIONS.get(cls, (cls,))
+
+    def __call__(self, obj, /):
+        return isinstance(obj, self.__args__)
+
+
+class _nominal_subclasscheck(_nominal_instancecheck):
+    def __call__(self, obj, /):
+        if tp.get_origin(obj) is tp.Literal:
+            return all(map(super().__call__, tp.get_args(obj)))
+        return issubclass(tp.get_origin(obj) or obj, self.__args__)
 
 
 class _ForwardRefSubscriptTransformer(ast.NodeTransformer):
@@ -218,13 +238,95 @@ class _ForwardRefSubscriptTransformer(ast.NodeTransformer):
                     locals.setdefault(cell_name, cell_value)
         if forwardref.__extra_names__:
             locals.update(forwardref.__extra_names__)
+        if (node := forwardref.__ast_node__) is None:
+            node = ast.parse(forwardref.__forward_arg__, mode="eval").body
         tree = ast.fix_missing_locations(
-            cls(globals=globals, locals=locals).visit(
-                ast.Expression(forwardref.__ast_node__)
-            )
+            cls(globals=globals, locals=locals).visit(ast.Expression(node))
         )
         code = compile(tree, "<ast>", "eval")
         return eval(code, globals, locals)
+
+
+def _evaluate(typx: tp.TypeAliasType | tp.ForwardRef, /):
+    if isinstance(typx, tp.ForwardRef):
+        return _ForwardRefSubscriptTransformer.evaluate_forwardref(typx)
+    if tp.get_args(typx):
+        return _make_typevars_bound(typx)
+    return typx.__value__
+
+
+_subtypes = weakref.WeakValueDictionary()
+
+
+class subtype(type):
+    def __new__(mcls, typx, /):
+        if (cls := _subtypes.get(typx)) is not None:
+            return cls
+        i_check = "__subtype_instancecheck__"
+        s_check = "__subtype_subclasscheck__"
+        namespace = {"__subtype_form__": typx}
+        match tp.get_origin(typx) or typx:
+            case None:
+                return mcls(types.NoneType)
+            case tp.Annotated:
+                return mcls(typx.__origin__)
+            case tp.Any:
+                namespace.update(dict.fromkeys((i_check, s_check), lambda _: True))
+            case tp.Never | tp.NoReturn:
+                namespace.update(dict.fromkeys((i_check, s_check), lambda _: False))
+            case tp.Literal:
+                namespace[i_check] = _literal_instancecheck(typx)
+                namespace[s_check] = _literal_subclasscheck(typx)
+            case tp.Union:
+                union = tp.Union[tuple(map(mcls, typx.__args__))]
+                namespace[i_check] = lambda obj: isinstance(obj, union)
+                namespace[s_check] = lambda src: issubclass(src, union)
+            case tp.TypeAliasType() | tp.ForwardRef():
+                # resolve on first check, so recursive references terminate
+                target = ft.cache(lambda: mcls(_evaluate(typx)))
+                namespace[i_check] = lambda obj: isinstance(obj, target())
+                namespace[s_check] = lambda src: issubclass(src, target())
+            case tp.NewType():
+                supertype = mcls(typx.__supertype__)
+                namespace[i_check] = lambda obj: isinstance(obj, supertype)
+                # __subclasscheck__ admits typx and the NewTypes derived from it
+                namespace[s_check] = lambda _: False
+            case type() if not tp.get_args(typx):
+                namespace[i_check] = _nominal_instancecheck(typx)
+                namespace[s_check] = _nominal_subclasscheck(typx)
+            case _:
+                raise NotImplementedError
+        name = f"{mcls.__name__}[{typx}]"
+        cls = _subtypes[typx] = super().__new__(mcls, name, (), namespace)
+        return cls
+
+    def __instancecheck__(cls, obj, /):
+        return cls.__subtype_instancecheck__(obj)
+
+    def __subclasscheck__(cls, src, /):
+        if src == cls.__subtype_form__:
+            return True
+        match tp.get_origin(src) or src:
+            case None:
+                return issubclass(types.NoneType, cls)
+            case tp.Any | tp.Never | tp.NoReturn:
+                return True
+            case tp.Union:
+                return all(issubclass(arg, cls) for arg in src.__args__)
+            case tp.Literal if len(src.__args__) > 1:
+                # a union dst can accept each value from a different member
+                return all(issubclass(tp.Literal[arg], cls) for arg in src.__args__)
+            case tp.Annotated:
+                return issubclass(src.__origin__, cls)
+            case tp.TypeAliasType() | tp.ForwardRef():
+                return issubclass(_evaluate(src), cls)
+            case tp.NewType():
+                return issubclass(src.__supertype__, cls)
+            case tp.TypeVar():
+                if src.__constraints__:
+                    return all(issubclass(c, cls) for c in src.__constraints__)
+                return issubclass(src.__bound__ or object, cls)
+        return cls.__subtype_subclasscheck__(src)
 
 
 @ft.cache
@@ -464,7 +566,7 @@ def _resolve_call(obj, /) -> tuple[tp.Sequence[tp.Callable], bool]:
         match obj.__reduce__():
             case str(name):
                 # sys.modules[obj.__module__][name] => function
-                members = _stub_overloads().get(sys.modules.get(obj.__module__), {})
+                members = _stub_overloads().get(sys.modules[obj.__module__], {})
                 return members.get(name, ()), False
             case _, (m_self, name):
                 # getattr(m_self, name) => unbound method
