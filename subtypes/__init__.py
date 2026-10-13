@@ -584,6 +584,124 @@ class _tuple_subclasscheck(_tuple_instancecheck):
         return _assign_tuple(self.__form__, obj, **ctx)
 
 
+def _callable_signature(typx: _SupportsGeneric, /) -> inspect.Signature:
+    params, ret = tp.get_args(typx)
+    if tp.get_origin(params) is tp.Concatenate:
+        *params, tail = tp.get_args(params)
+    elif isinstance(params, list):
+        tail = None
+    else:
+        params, tail = [], params
+    if isinstance(tail, tp.ParamSpec):
+        raise NotImplementedError
+    sig = [
+        inspect.Parameter(f"_{i}", inspect.Parameter.POSITIONAL_ONLY, annotation=t)
+        for i, t in enumerate(params)
+    ]
+    if tail is ...:
+        sig += [
+            inspect.Parameter("args", inspect.Parameter.VAR_POSITIONAL),
+            inspect.Parameter("kwargs", inspect.Parameter.VAR_KEYWORD),
+        ]
+    return inspect.Signature(sig, return_annotation=ret)
+
+
+def _assign_signature(
+    dst: inspect.Signature, src: inspect.Signature, /, **ctx: tp.Unpack[_AssignContext]
+) -> bool:
+    """Return whether src is assignable to dst, the signature of a Callable form."""
+
+    def annotation(typx, /):
+        return tp.Any if typx is inspect.Parameter.empty else typx
+
+    if not _assign_with_variance(
+        dst.return_annotation,
+        annotation(src.return_annotation),
+        _Variance.COVARIANT,
+        **ctx,
+    ):
+        return False
+    src_params = [*src.parameters.values()]
+    for dst_param in dst.parameters.values():
+        # the ... of dst accepts the remaining parameters of src
+        if dst_param.kind is not inspect.Parameter.POSITIONAL_ONLY:
+            return True
+        if not src_params or src_params[0].kind > inspect.Parameter.VAR_POSITIONAL:
+            return False
+        if src_params[0].kind is inspect.Parameter.VAR_POSITIONAL:
+            src_param = src_params[0]
+        else:
+            src_param = src_params.pop(0)
+        if not _assign_with_variance(
+            dst_param.annotation,
+            annotation(src_param.annotation),
+            _Variance.CONTRAVARIANT,
+            **ctx,
+        ):
+            return False
+    return all(
+        p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        or p.default is not inspect.Parameter.empty
+        for p in src_params
+    )
+
+
+class _callable_instancecheck(_checker):
+    def __init__(self, typx: _SupportsGeneric, /):
+        self.signature = _callable_signature(typx)
+
+    def __call__(self, obj, /, **ctx):
+        if not callable(obj):
+            return False
+        # Self in the signature of obj is the class obj binds to
+        owner = getattr(obj, "__self__", obj)
+        ctx["self_class"] = owner if isinstance(owner, type) else type(owner)
+        return any(
+            _assign_signature(self.signature, sig, **ctx) for sig in _get_overloads(obj)
+        )
+
+
+class _callable_subclasscheck(_callable_instancecheck):
+    def __call__(self, obj, /, **ctx):
+        origin = tp.get_origin(obj) or obj
+        if origin is collections.abc.Callable and tp.get_args(obj):
+            sigs = (_callable_signature(obj),)
+        elif origin is builtins.type and tp.get_args(obj):
+            # a value of type[X] calls the constructor of X
+            [ctx["self_class"]] = tp.get_args(obj)
+            sigs = _get_overloads(tp.get_origin(ctx["self_class"]) or ctx["self_class"])
+        elif isinstance(origin, type) and issubclass(origin, collections.abc.Callable):
+            call = inspect.getattr_static(origin, "__call__")
+            ovs, _ = _resolve_call(call)
+            sigs = _get_signatures(*(ovs or (call,)), is_bound=True)
+        else:
+            return False
+        return any(_assign_signature(self.signature, sig, **ctx) for sig in sigs)
+
+
+class _type_instancecheck(_checker):
+    def __init__(self, typx: _SupportsGeneric, /):
+        [arg] = typx.__args__
+        self.__form__ = subtype(arg)
+
+    def __call__(self, obj, /, **ctx):
+        return isinstance(obj, type) and _assign_type(self.__form__, obj, **ctx)
+
+
+class _type_subclasscheck(_type_instancecheck):
+    def __call__(self, obj, /, **ctx):
+        origin = tp.get_origin(obj) or obj
+        if origin is builtins.type:
+            # a bare type is type[Any]
+            [arg] = tp.get_args(obj) or [tp.Any]
+        elif isinstance(origin, type) and issubclass(origin, builtins.type):
+            # an instance of a metaclass is a class
+            arg = object
+        else:
+            return False
+        return _assign_type(self.__form__, arg, **ctx)
+
+
 _subtypes = weakref.WeakValueDictionary()
 _inferred_variance = weakref.WeakKeyDictionary()
 
@@ -653,8 +771,12 @@ class subtype(type):
             case type() if not tp.get_args(typx):
                 namespace[i_check] = _nominal_instancecheck(typx)
                 namespace[s_check] = _nominal_subclasscheck(typx)
-            case collections.abc.Callable | builtins.type:
-                raise NotImplementedError
+            case collections.abc.Callable:
+                namespace[i_check] = _callable_instancecheck(typx)
+                namespace[s_check] = _callable_subclasscheck(typx)
+            case builtins.type:
+                namespace[i_check] = _type_instancecheck(typx)
+                namespace[s_check] = _type_subclasscheck(typx)
             case type():
                 namespace[i_check] = _generic_instancecheck(typx)
                 namespace[s_check] = _generic_subclasscheck(typx)
@@ -712,6 +834,18 @@ def _assign_type(dst: subtype, src, /, **ctx: tp.Unpack[_AssignContext]) -> bool
             if src.__constraints__:
                 return all(_assign_type(dst, c, **ctx) for c in src.__constraints__)
             return _assign_type(dst, src.__bound__ or object, **ctx)
+        case builtins.type if tp.get_args(src):
+            [arg] = tp.get_args(src)
+            # type[...] distributes over a union, and takes the bound or
+            # constraints of a TypeVar
+            if tp.get_origin(arg) is tp.Union:
+                return all(_assign_type(dst, type[a], **ctx) for a in arg.__args__)
+            if isinstance(arg, tp.TypeVar):
+                if arg.__constraints__:
+                    return all(
+                        _assign_type(dst, type[c], **ctx) for c in arg.__constraints__
+                    )
+                return _assign_type(dst, type[arg.__bound__ or object], **ctx)
     return dst.__subtype_subclasscheck__(src, **ctx)
 
 
@@ -1034,5 +1168,19 @@ def _get_overloads(obj: tp.Callable, /) -> tuple[inspect.Signature, ...]:
         raise TypeError
     ovs, is_bound = _resolve_call(obj)
     if ovs:
-        return _get_signatures(*ovs, is_bound=is_bound)
-    return (inspect.signature(obj, annotation_format=annotationlib.Format.FORWARDREF),)
+        sigs = _get_signatures(*ovs, is_bound=is_bound)
+    else:
+        sigs = (
+            inspect.signature(obj, annotation_format=annotationlib.Format.FORWARDREF),
+        )
+    if isinstance(obj, type):
+        # an unannotated or __init__ signature returns an instance of the class
+        return tuple(
+            (
+                sig.replace(return_annotation=tp.Self)
+                if sig.return_annotation in (None, inspect.Signature.empty)
+                else sig
+            )
+            for sig in sigs
+        )
+    return sigs
