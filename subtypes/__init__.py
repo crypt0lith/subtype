@@ -3,6 +3,7 @@ import annotationlib
 import ast
 import builtins
 import functools as ft
+import inspect
 import types
 import typing as tp
 
@@ -235,8 +236,8 @@ def _builtin_callables():
             lambda k, d=(_collections_abc.__dict__ | builtins.__dict__): (k, d[k]),
             _collections_abc.__dict__.keys() ^ builtins.__dict__.keys(),
         )
-        if not isinstance(v, types.ModuleType)
-        if callable(v) or not k.startswith("_")
+        if callable(v)
+        if hasattr(builtins, k) or not k.startswith("_")
     }
     return types.MappingProxyType(out)
 
@@ -381,3 +382,88 @@ def _builtin_overloads() -> types.MappingProxyType[str, tuple[types.FunctionType
     return types.MappingProxyType(
         {qualname: tuple(ovs.values()) for qualname, ovs in out["builtins"].items()}
     )
+
+
+def _resolve_call(obj, /) -> tuple[tp.Sequence[tp.Callable], bool]:
+    """Return the overloads that calling obj calls, and whether the call binds
+    their self or cls parameter.
+    """
+
+    def lookup(mro, /, *names: str):
+        for cls in mro:
+            if getattr(builtins, cls.__name__, None) is cls:
+                ov_d = _builtin_overloads()
+                keys = (f"{cls.__qualname__}.{name}" for name in names)
+                decls = [ov_d[key] for key in keys if key in ov_d]
+            else:
+                attrs = (vars(cls)[name] for name in names if name in vars(cls))
+                decls = [
+                    (
+                        tp.get_overloads(a)
+                        if isinstance(getattr(a, "__func__", a), types.FunctionType)
+                        else ()
+                    )
+                    for a in attrs
+                ]
+            if decls:
+                return max(decls, key=len)
+        return ()
+
+    objtype = type(obj)
+    if isinstance(obj, types.FunctionType) or hasattr(objtype, "__func__"):
+        return tp.get_overloads(obj), hasattr(objtype, "__self__")
+    if hasattr(objtype, "__self__"):
+        # __self__ is None for C static methods, so get the module name
+        # or self type from __reduce__ instead.
+        match obj.__reduce__():
+            case str(name):
+                # sys.modules[obj.__module__][name] => function
+                if obj.__module__ == builtins.__name__:
+                    return _builtin_overloads().get(name, ()), False
+                return (), False
+            case _, (m_self, name):
+                # getattr(m_self, name) => unbound method
+                if isinstance(m_self, type):
+                    # include the metaclass in attribute lookup
+                    mro = (*m_self.__mro__, *type(m_self).__mro__)
+                else:
+                    mro = type(m_self).__mro__
+                # special case for tp_new: __new__ is a C static method
+                # where __self__ is m_self
+                is_bound = getattr(obj, "__self__", None) is m_self
+                return lookup(mro, name), is_bound and name != "__new__"
+    if hasattr(objtype, "__objclass__"):
+        # unbound C method descriptor
+        return lookup(obj.__objclass__.__mro__, obj.__name__), False
+    call = next(
+        vars(cls)["__call__"] for cls in objtype.__mro__ if "__call__" in vars(cls)
+    )
+    if call is vars(type)["__call__"]:
+        # the constructor type.__call__ delegates to
+        return lookup(obj.__mro__, "__new__", "__init__"), True
+    if hasattr(type(call), "__get__"):
+        call = call.__get__(obj, objtype)
+    return _resolve_call(call)
+
+
+@ft.lru_cache
+def _get_signatures(*funcs: tp.Callable, is_bound=False):
+    sigs = map(
+        ft.partial(
+            inspect.signature, annotation_format=annotationlib.Format.FORWARDREF
+        ),
+        # unwrap __func__ from a classmethod or staticmethod
+        (getattr(func, "__func__", func) for func in funcs),
+    )
+    if is_bound:
+        sigs = (sig.replace(parameters=[*sig.parameters.values()][1:]) for sig in sigs)
+    return tuple(sigs)
+
+
+def _get_overloads(obj: tp.Callable, /) -> tuple[inspect.Signature, ...]:
+    if not callable(obj):
+        raise TypeError
+    ovs, is_bound = _resolve_call(obj)
+    if ovs:
+        return _get_signatures(*ovs, is_bound=is_bound)
+    return (inspect.signature(obj, annotation_format=annotationlib.Format.FORWARDREF),)
