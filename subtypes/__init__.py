@@ -2,6 +2,8 @@ import abc
 import annotationlib
 import ast
 import builtins
+import collections.abc
+import enum
 import functools as ft
 import inspect
 import sys
@@ -151,24 +153,35 @@ class _SupportsGeneric[T = type[tp.Any]](tp.Protocol):
     __args__: tuple[object, ...]
 
 
+class _Variance(enum.Enum):
+    INVARIANT = enum.auto()
+    COVARIANT = enum.auto()
+    CONTRAVARIANT = enum.auto()
+
+
+class _AssignContext(tp.TypedDict):
+    assuming: frozenset[tuple[subtype, tp.Any]]
+    assumed_variance: tp.Mapping[type, _Variance]
+
+
 class _checker(abc.ABC):
     def __init__(self, typx: _SupportsGeneric, /):
         self.__args__ = typx.__args__
 
     @abc.abstractmethod
-    def __call__(self, obj: tp.Any, /) -> bool: ...
+    def __call__(self, obj: tp.Any, /, **ctx: tp.Unpack[_AssignContext]) -> bool: ...
 
 
 class _literal_instancecheck(_checker):
-    def __call__(self, obj, /):
+    def __call__(self, obj, /, **ctx):
         # Literal[1] excludes True
         return any(type(obj) is type(a) and obj == a for a in self.__args__)
 
 
 class _literal_subclasscheck(_literal_instancecheck):
-    def __call__(self, obj, /):
+    def __call__(self, obj, /, **ctx):
         return tp.get_origin(obj) is tp.Literal and all(
-            map(super().__call__, tp.get_args(obj))
+            map(ft.partial(super().__call__, **ctx), tp.get_args(obj))
         )
 
 
@@ -176,17 +189,17 @@ _PROMOTIONS = {float: (float, int), complex: (complex, float, int)}
 
 
 class _nominal_instancecheck(_checker):
-    def __init__(self, cls: type, /):
-        self.__args__ = _PROMOTIONS.get(cls, (cls,))
+    def __init__(self, typx: type, /):
+        self.__args__ = _PROMOTIONS.get(typx, (typx,))
 
-    def __call__(self, obj, /):
+    def __call__(self, obj, /, **ctx):
         return isinstance(obj, self.__args__)
 
 
 class _nominal_subclasscheck(_nominal_instancecheck):
-    def __call__(self, obj, /):
+    def __call__(self, obj, /, **ctx):
         if tp.get_origin(obj) is tp.Literal:
-            return all(map(super().__call__, tp.get_args(obj)))
+            return all(map(ft.partial(super().__call__, **ctx), tp.get_args(obj)))
         return issubclass(tp.get_origin(obj) or obj, self.__args__)
 
 
@@ -255,10 +268,235 @@ def _evaluate(typx: tp.TypeAliasType | tp.ForwardRef, /):
     return typx.__value__
 
 
+def _default_arg(param: tp.TypeVar, /, *, erased: bool):
+    # a value's type arguments are erased at runtime
+    if erased:
+        return tp.Any
+    if param.has_default():
+        return param.__default__
+    if param.__constraints__:
+        return tp.Union[param.__constraints__]
+    return object if param.__bound__ is None else param.__bound__
+
+
+def _generic_bases(typx: type, /) -> tuple[tuple[_TypeParameter, ...], tuple]:
+    """Return the type parameters and generic bases of typx."""
+    if (bases := vars(typx).get("__orig_bases__")) is None:
+        bases = _stub_bases().get(typx, typx.__bases__)
+    for base in bases:
+        if tp.get_origin(base) in (tp.Generic, tp.Protocol):
+            return tp.get_args(base), bases
+    # a bare typing alias like typing.MappingView has no __parameters__
+    params = (
+        p for b in bases if tp.get_origin(b) for p in getattr(b, "__parameters__", ())
+    )
+    return tuple(dict.fromkeys(params)), bases
+
+
+def _map_args(src, dst: type, /, *, erased: bool) -> dict[tp.TypeVar, tp.Any] | None:
+    """Map the type parameters of dst to the arguments src passes to them, or
+    return None if no generic base of src leads to dst.
+    """
+    src_origin = tp.get_origin(src) or src
+    params, bases = _generic_bases(src_origin)
+    args = tp.get_args(src)
+    subst: dict[tp.TypeVar, tp.Any] = {}
+    for i, param in enumerate(params):
+        if not isinstance(param, tp.TypeVar):
+            return
+        arg = args[i] if i < len(args) else _default_arg(param, erased=erased)
+        subst[param] = tp.Any if arg is ... else arg
+    if src_origin is dst:
+        return subst
+    for base in bases:
+        origin = tp.get_origin(base) or base
+        if origin in (tp.Generic, tp.Protocol) or not isinstance(origin, type):
+            continue
+        base = _substitute(base, subst)
+        if (mapped := _map_args(base, dst, erased=erased)) is not None:
+            return mapped
+
+
+def _substitute(typx, subst: tp.Mapping, /):
+    if isinstance(typx, tp.TypeVar):
+        return subst.get(typx, typx)
+    if tp.get_origin(typx) and (params := getattr(typx, "__parameters__", ())):
+        return typx[*(subst.get(p, p) for p in params)]
+    return typx
+
+
+class _VarianceDummy:
+    pass
+
+
+def _variance(
+    typx: type, param: tp.TypeVar, /, *, assumed_variance: tp.Mapping[type, _Variance]
+) -> _Variance:
+    if (assumed := assumed_variance.get(typx)) is not None:
+        return assumed
+    if param.__covariant__:
+        return _Variance.COVARIANT
+    if param.__contravariant__:
+        return _Variance.CONTRAVARIANT
+    if not param.__infer_variance__:
+        return _Variance.INVARIANT
+    if (variances := _inferred_variance.get(typx)) is None:
+        variances = _inferred_variance[typx] = _infer_variance(
+            typx, assumed_variance=assumed_variance
+        )
+    return variances[param]
+
+
+def _infer_variance(
+    typx, /, *, assumed_variance: tp.Mapping[type, _Variance]
+) -> dict[tp.TypeVar, _Variance]:
+    params, _ = _generic_bases(typx)
+    out = {}
+    for param in params:
+        if not (isinstance(param, tp.TypeVar) and param.__infer_variance__):
+            continue
+        bound = types.new_class(param.__name__)
+        upper = typx[*(object if p is param else _VarianceDummy for p in params)]
+        lower = typx[*(bound if p is param else _VarianceDummy for p in params)]
+        # references to typx in its members compare by the assumed variance
+        if _assign_class_to_self(
+            upper,
+            lower,
+            assuming=frozenset(),
+            assumed_variance={**assumed_variance, typx: _Variance.COVARIANT},
+        ):
+            out[param] = _Variance.COVARIANT
+        elif _assign_class_to_self(
+            lower,
+            upper,
+            assuming=frozenset(),
+            assumed_variance={**assumed_variance, typx: _Variance.CONTRAVARIANT},
+        ):
+            out[param] = _Variance.CONTRAVARIANT
+        else:
+            out[param] = _Variance.INVARIANT
+    return out
+
+
+def _assign_class_to_self(
+    dst: _SupportsGeneric, src: _SupportsGeneric, /, **ctx: tp.Unpack[_AssignContext]
+) -> bool:
+    params, _ = _generic_bases(dst.__origin__)
+    dst_subst = dict(zip(params, dst.__args__))
+    src_subst = dict(zip(params, src.__args__))
+    return all(
+        _assign_with_variance(
+            _substitute(form, dst_subst), _substitute(form, src_subst), variance, **ctx
+        )
+        for form, variance in _declared_types(dst.__origin__)
+    )
+
+
+def _declared_types(typx: type, /) -> list[tuple[tp.Any, _Variance]]:
+    """Return the types declared in the members and generic bases of typx,
+    each with the variance its assignment requires.
+    """
+    out = []
+    annotations = annotationlib.get_annotations(
+        typx, format=annotationlib.Format.FORWARDREF
+    )
+    for name, form in annotations.items():
+        final = False
+        while tp.get_origin(form) in (tp.ClassVar, tp.Final):
+            final |= tp.get_origin(form) is tp.Final
+            [form] = tp.get_args(form)
+        dunder = name.startswith("__") and name.endswith("__")
+        if final or (name.startswith("_") and not dunder):
+            out.append((form, _Variance.COVARIANT))
+        else:
+            # a frozen dataclass or NamedTuple field is replaceable by __replace__
+            out.append((form, _Variance.INVARIANT))
+    for name, attr in vars(typx).items():
+        if name in ("__new__", "__init__"):
+            continue
+        is_bound = not isinstance(attr, staticmethod)
+        if isinstance(attr, property):
+            funcs = (attr.fget, attr.fset, attr.fdel)
+        else:
+            funcs = (attr,)
+        for func in funcs:
+            func = getattr(func, "__func__", func)
+            if not isinstance(func, types.FunctionType):
+                continue
+            ovs = tp.get_overloads(func) or (func,)
+            for sig in _get_signatures(*ovs, is_bound=is_bound):
+                out += [
+                    (p.annotation, _Variance.CONTRAVARIANT)
+                    for p in sig.parameters.values()
+                ]
+                out.append((sig.return_annotation, _Variance.COVARIANT))
+    _, bases = _generic_bases(typx)
+    out += [
+        (base, _Variance.COVARIANT)
+        for base in bases
+        if tp.get_origin(base) not in (tp.Generic, tp.Protocol, builtins.tuple)
+    ]
+    return out
+
+
+def _assign_with_variance(
+    dst, src, variance: _Variance, /, **ctx: tp.Unpack[_AssignContext]
+) -> bool:
+    if dst == src:
+        return True
+    if variance is not _Variance.CONTRAVARIANT and not _assign_type(
+        subtype(dst), src, **ctx
+    ):
+        return False
+    return variance is _Variance.COVARIANT or _assign_type(subtype(src), dst, **ctx)
+
+
+def _assign_generic(
+    dst: _SupportsGeneric, src, /, *, erased=False, **ctx: tp.Unpack[_AssignContext]
+):
+    if not issubclass(tp.get_origin(src) or src, dst.__origin__):
+        return False
+    src_args = _map_args(src, dst.__origin__, erased=erased)
+    dst_args = _map_args(dst, dst.__origin__, erased=False)
+    if src_args is None or dst_args is None:
+        return True
+    return all(
+        _assign_with_variance(
+            dst_arg,
+            src_args[p],
+            _variance(dst.__origin__, p, assumed_variance=ctx["assumed_variance"]),
+            **ctx,
+        )
+        for p, dst_arg in dst_args.items()
+    )
+
+
+class _generic_instancecheck(_checker):
+    def __init__(self, typx: _SupportsGeneric, /):
+        self.__form__ = typx
+
+    def __call__(self, obj, /, **ctx):
+        if (src := getattr(obj, "__dict__", {}).get("__orig_class__")) is not None:
+            return _assign_generic(self.__form__, src, **ctx)
+        return _assign_generic(self.__form__, type(obj), erased=True, **ctx)
+
+
+class _generic_subclasscheck(_generic_instancecheck):
+    def __call__(self, obj, /, **ctx):
+        if tp.get_origin(obj) is tp.Literal:
+            return all(map(ft.partial(super().__call__, **ctx), tp.get_args(obj)))
+        return _assign_generic(self.__form__, obj, **ctx)
+
+
 _subtypes = weakref.WeakValueDictionary()
+_inferred_variance = weakref.WeakKeyDictionary()
 
 
 class subtype(type):
+    __subtype_form__: tp.Any
+    __subtype_instancecheck__: _checker
+    __subtype_subclasscheck__: _checker
+
     def __new__(mcls, typx, /):
         if (cls := _subtypes.get(typx)) is not None:
             return cls
@@ -271,62 +509,96 @@ class subtype(type):
             case tp.Annotated:
                 return mcls(typx.__origin__)
             case tp.Any:
-                namespace.update(dict.fromkeys((i_check, s_check), lambda _: True))
+                namespace.update(
+                    dict.fromkeys((i_check, s_check), lambda _, **ctx: True)
+                )
             case tp.Never | tp.NoReturn:
-                namespace.update(dict.fromkeys((i_check, s_check), lambda _: False))
+                namespace.update(
+                    dict.fromkeys((i_check, s_check), lambda _, **ctx: False)
+                )
             case tp.Literal:
                 namespace[i_check] = _literal_instancecheck(typx)
                 namespace[s_check] = _literal_subclasscheck(typx)
             case tp.Union:
-                union = tp.Union[tuple(map(mcls, typx.__args__))]
-                namespace[i_check] = lambda obj: isinstance(obj, union)
-                namespace[s_check] = lambda src: issubclass(src, union)
+                members = tuple(map(mcls, typx.__args__))
+                namespace[i_check] = lambda obj, **ctx: any(
+                    m.__subtype_instancecheck__(obj, **ctx) for m in members
+                )
+                namespace[s_check] = lambda src, **ctx: any(
+                    _assign_type(m, src, **ctx) for m in members
+                )
             case tp.TypeAliasType() | tp.ForwardRef():
                 # resolve on first check, so recursive references terminate
-                target = ft.cache(lambda: mcls(_evaluate(typx)))
-                namespace[i_check] = lambda obj: isinstance(obj, target())
-                namespace[s_check] = lambda src: issubclass(src, target())
+                resolved = ft.cache(lambda: mcls(_evaluate(typx)))
+                namespace[i_check] = lambda obj, **ctx: (
+                    resolved().__subtype_instancecheck__(obj, **ctx)
+                )
+                namespace[s_check] = lambda src, **ctx: _assign_type(
+                    resolved(), src, **ctx
+                )
             case tp.NewType():
                 supertype = mcls(typx.__supertype__)
-                namespace[i_check] = lambda obj: isinstance(obj, supertype)
-                # __subclasscheck__ admits typx and the NewTypes derived from it
-                namespace[s_check] = lambda _: False
+                namespace[i_check] = lambda obj, **ctx: (
+                    supertype.__subtype_instancecheck__(obj, **ctx)
+                )
+                # _assign_type admits typx and the NewTypes derived from it
+                namespace[s_check] = lambda _, **ctx: False
             case type() if not tp.get_args(typx):
                 namespace[i_check] = _nominal_instancecheck(typx)
                 namespace[s_check] = _nominal_subclasscheck(typx)
+            case collections.abc.Callable | builtins.tuple | builtins.type:
+                raise NotImplementedError
+            case type():
+                namespace[i_check] = _generic_instancecheck(typx)
+                namespace[s_check] = _generic_subclasscheck(typx)
             case _:
                 raise NotImplementedError
-        name = f"{mcls.__name__}[{typx}]"
-        cls = _subtypes[typx] = super().__new__(mcls, name, (), namespace)
-        return cls
+        return _subtypes.setdefault(
+            typx, super().__new__(mcls, mcls.__name__, (), namespace)
+        )
+
+    def __repr__(cls):
+        return "{0.__name__}({0.__subtype_form__})".format(cls)
 
     def __instancecheck__(cls, obj, /):
-        return cls.__subtype_instancecheck__(obj)
+        return cls.__subtype_instancecheck__(
+            obj, assuming=frozenset(), assumed_variance={}
+        )
 
     def __subclasscheck__(cls, src, /):
-        if src == cls.__subtype_form__:
+        return _assign_type(cls, src, assuming=frozenset(), assumed_variance={})
+
+
+def _assign_type(dst: subtype, src, /, **ctx: tp.Unpack[_AssignContext]) -> bool:
+    if src == dst.__subtype_form__:
+        return True
+    match tp.get_origin(src) or src:
+        case None:
+            return _assign_type(dst, types.NoneType, **ctx)
+        case tp.Any | tp.Never | tp.NoReturn:
             return True
-        match tp.get_origin(src) or src:
-            case None:
-                return issubclass(types.NoneType, cls)
-            case tp.Any | tp.Never | tp.NoReturn:
+        case tp.Union:
+            return all(_assign_type(dst, arg, **ctx) for arg in src.__args__)
+        case tp.Literal if len(src.__args__) > 1:
+            # a union dst can accept each value from a different member
+            return all(
+                _assign_type(dst, tp.Literal[arg], **ctx) for arg in src.__args__
+            )
+        case tp.Annotated:
+            return _assign_type(dst, src.__origin__, **ctx)
+        case tp.TypeAliasType() | tp.ForwardRef():
+            # a recursive alias reaches the same pair again, which then holds
+            if (dst, src) in ctx["assuming"]:
                 return True
-            case tp.Union:
-                return all(issubclass(arg, cls) for arg in src.__args__)
-            case tp.Literal if len(src.__args__) > 1:
-                # a union dst can accept each value from a different member
-                return all(issubclass(tp.Literal[arg], cls) for arg in src.__args__)
-            case tp.Annotated:
-                return issubclass(src.__origin__, cls)
-            case tp.TypeAliasType() | tp.ForwardRef():
-                return issubclass(_evaluate(src), cls)
-            case tp.NewType():
-                return issubclass(src.__supertype__, cls)
-            case tp.TypeVar():
-                if src.__constraints__:
-                    return all(issubclass(c, cls) for c in src.__constraints__)
-                return issubclass(src.__bound__ or object, cls)
-        return cls.__subtype_subclasscheck__(src)
+            ctx["assuming"] |= {(dst, src)}
+            return _assign_type(dst, _evaluate(src), **ctx)
+        case tp.NewType():
+            return _assign_type(dst, src.__supertype__, **ctx)
+        case tp.TypeVar():
+            if src.__constraints__:
+                return all(_assign_type(dst, c, **ctx) for c in src.__constraints__)
+            return _assign_type(dst, src.__bound__ or object, **ctx)
+    return dst.__subtype_subclasscheck__(src, **ctx)
 
 
 @ft.cache
@@ -346,14 +618,7 @@ def _builtin_callables():
 
 
 @ft.cache
-def _stub_overloads() -> (
-    types.MappingProxyType[
-        type | types.ModuleType,
-        types.MappingProxyType[str, tuple[types.FunctionType, ...]],
-    ]
-):
-    """Map runtime classes and modules to their stub overloads, by name."""
-
+def _load_stubs():
     class TypeAliasTransformer(_ForwardRefSubscriptTransformer):
         def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.stmt:
             # check if this is a self-referential TypeAlias
@@ -384,6 +649,7 @@ def _stub_overloads() -> (
             # __builtins__ fallback for the stub definitions _body deletes
             self._runtime = builtins.__dict__ | {"overload": tp.overload} | vars(module)
             self.overloads = None
+            self.classes = {}
 
         def collect(self, node, /):
             res = ast.fix_missing_locations(self.visit(node))
@@ -396,11 +662,19 @@ def _stub_overloads() -> (
                 tp._overload_registry = self.overloads
                 exec(
                     compile(res, "<ast>", "exec", dont_inherit=True),
-                    {"__name__": name, "__builtins__": self._runtime},
+                    {
+                        "__name__": name,
+                        "__builtins__": self._runtime,
+                        "__stub_class__": self._register,
+                    },
                 )
             finally:
                 tp._overload_registry = prev
             return self.overloads[name]
+
+        def _register(self, typx: type, /):
+            self.classes[typx.__name__] = typx
+            return typx
 
         def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.ImportFrom:
             if node.module == "typing":
@@ -417,8 +691,21 @@ def _stub_overloads() -> (
                     out.append(s)
                 elif isinstance(s, ast.ClassDef):
                     if s.name in self._runtime:
+                        bases = s.bases
                         s.bases, s.keywords, s.decorator_list = [], [], []
                         s.body = self._body(s.body, depth + 1)
+                        if bases and not depth:
+                            # evaluated once the module no longer binds the
+                            # stub definitions
+                            s.body.append(
+                                ast.AnnAssign(
+                                    ast.Name("__orig_bases__", ast.Store()),
+                                    self.visit(ast.Tuple(bases, ast.Load())),
+                                    None,
+                                    simple=1,
+                                )
+                            )
+                            s.decorator_list = [ast.Name("__stub_class__", ast.Load())]
                         out += [s, ast.Delete([ast.Name(s.name, ast.Del())])]
                     else:
                         s.decorator_list = [
@@ -480,8 +767,14 @@ def _stub_overloads() -> (
 
             return {**st, "mtime": max(st["mtime"], stat(__file__).st_mtime)}
 
+    def runtime_class(module, name):
+        owner = vars(module).get(name)
+        owner = tp.get_origin(owner) or owner
+        return owner if isinstance(owner, type) else None
+
     STUBS = files(__name__) / "_stubs"
     out = {}
+    bases = {}
     with as_file(STUBS / "_typeshed" / "__init__.pyi") as path:
         spec = spec_from_loader(
             "_typeshed", PyiLoader("_typeshed", str(path)), is_package=True
@@ -496,24 +789,39 @@ def _stub_overloads() -> (
                 ("_collections_abc.pyi", _collections_abc),
                 ("typing.pyi", tp),
             ):
-                collected = OverloadCollector(module).collect(
-                    ast.parse((STUBS / stub).read_bytes())
-                )
+                collector = OverloadCollector(module)
+                collected = collector.collect(ast.parse((STUBS / stub).read_bytes()))
                 for qualname, ovs in collected.items():
                     head, sep, name = qualname.partition(".")
                     if not sep:
                         owner, name = module, head
-                    else:
-                        owner = vars(module).get(head)
-                        owner = tp.get_origin(owner) or owner
-                        if not isinstance(owner, type):
-                            continue
+                    elif (owner := runtime_class(module, head)) is None:
+                        continue
                     out.setdefault(owner, {})[name] = tuple(ovs.values())
+                for name, typx in collector.classes.items():
+                    if (owner := runtime_class(module, name)) is not None:
+                        bases[owner] = annotationlib.get_annotations(
+                            typx, format=annotationlib.Format.FORWARDREF
+                        )["__orig_bases__"]
         finally:
             del sys.modules["_typeshed"]
-    return types.MappingProxyType(
-        {owner: types.MappingProxyType(d) for owner, d in out.items()}
-    )
+    overloads = {owner: types.MappingProxyType(d) for owner, d in out.items()}
+    return types.MappingProxyType(overloads), types.MappingProxyType(bases)
+
+
+def _stub_overloads() -> (
+    types.MappingProxyType[
+        type | types.ModuleType,
+        types.MappingProxyType[str, tuple[types.FunctionType, ...]],
+    ]
+):
+    """Map runtime classes and modules to their stub overloads, by name."""
+    return _load_stubs()[0]
+
+
+def _stub_bases() -> types.MappingProxyType[type, tuple[tp.Any, ...]]:
+    """Map runtime classes to their generic bases in the stubs."""
+    return _load_stubs()[1]
 
 
 @ft.cache
@@ -537,11 +845,11 @@ def _resolve_call(obj, /) -> tuple[tp.Sequence[tp.Callable], bool]:
     """
 
     def lookup(mro, /, *names: str):
-        for cls in mro:
-            if (members := _stub_overloads().get(cls)) is not None:
+        for typx in mro:
+            if (members := _stub_overloads().get(typx)) is not None:
                 decls = [members[name] for name in names if name in members]
             else:
-                attrs = (vars(cls)[name] for name in names if name in vars(cls))
+                attrs = (vars(typx)[name] for name in names if name in vars(typx))
                 decls = [
                     (
                         tp.get_overloads(a)
@@ -583,7 +891,7 @@ def _resolve_call(obj, /) -> tuple[tp.Sequence[tp.Callable], bool]:
         # unbound C method descriptor
         return lookup(obj.__objclass__.__mro__, obj.__name__), False
     call = next(
-        vars(cls)["__call__"] for cls in objtype.__mro__ if "__call__" in vars(cls)
+        vars(typx)["__call__"] for typx in objtype.__mro__ if "__call__" in vars(typx)
     )
     if call is vars(type)["__call__"]:
         # the constructor type.__call__ delegates to
