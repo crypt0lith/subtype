@@ -4,6 +4,7 @@ import ast
 import builtins
 import functools as ft
 import inspect
+import sys
 import types
 import typing as tp
 
@@ -243,7 +244,14 @@ def _builtin_callables():
 
 
 @ft.cache
-def _builtin_overloads() -> types.MappingProxyType[str, tuple[types.FunctionType, ...]]:
+def _stub_overloads() -> (
+    types.MappingProxyType[
+        type | types.ModuleType,
+        types.MappingProxyType[str, tuple[types.FunctionType, ...]],
+    ]
+):
+    """Map runtime classes and modules to their stub overloads, by name."""
+
     class TypeAliasTransformer(_ForwardRefSubscriptTransformer):
         def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.stmt:
             # check if this is a self-referential TypeAlias
@@ -268,22 +276,29 @@ def _builtin_overloads() -> types.MappingProxyType[str, tuple[types.FunctionType
             return node
 
     class OverloadCollector(TypeAliasTransformer):
-        def __init__(self):
+        def __init__(self, module: types.ModuleType, /):
             super().__init__(globals=_builtin_callables())
+            self._module = module
+            # __builtins__ fallback for the stub definitions _body deletes
+            self._runtime = builtins.__dict__ | {"overload": tp.overload} | vars(module)
             self.overloads = None
 
-        def collect(self, node, _globals=None, /):
+        def collect(self, node, /):
             res = ast.fix_missing_locations(self.visit(node))
+            name = self._module.__name__
             prev = tp._overload_registry
             try:
                 self.overloads = tp._overload_registry.__class__(
                     tp._overload_registry.default_factory
                 )
                 tp._overload_registry = self.overloads
-                exec(compile(res, "<ast>", "exec", dont_inherit=True), _globals or {})
+                exec(
+                    compile(res, "<ast>", "exec", dont_inherit=True),
+                    {"__name__": name, "__builtins__": self._runtime},
+                )
             finally:
                 tp._overload_registry = prev
-            return self.overloads
+            return self.overloads[name]
 
         def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.ImportFrom:
             if node.module == "typing":
@@ -299,7 +314,7 @@ def _builtin_overloads() -> types.MappingProxyType[str, tuple[types.FunctionType
                     s.orelse = self._body(s.orelse, depth) if s.orelse else []
                     out.append(s)
                 elif isinstance(s, ast.ClassDef):
-                    if s.name in self._ns:
+                    if s.name in self._runtime:
                         s.bases, s.keywords, s.decorator_list = [], [], []
                         s.body = self._body(s.body, depth + 1)
                         out += [s, ast.Delete([ast.Name(s.name, ast.Del())])]
@@ -313,7 +328,7 @@ def _builtin_overloads() -> types.MappingProxyType[str, tuple[types.FunctionType
                         ]
                         out.append(s)
                 elif isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    if depth or s.name in self._ns:
+                    if depth or s.name in self._runtime:
                         is_prop = False
                         for d in s.decorator_list:
                             if isinstance(d, ast.Name) and d.id in {
@@ -345,7 +360,7 @@ def _builtin_overloads() -> types.MappingProxyType[str, tuple[types.FunctionType
             node.body = self._body(node.body)
             return node
 
-    import sys
+    import _collections_abc
     from importlib.machinery import SourceFileLoader
     from importlib.resources import as_file, files
     from importlib.util import module_from_spec, spec_from_loader
@@ -364,6 +379,7 @@ def _builtin_overloads() -> types.MappingProxyType[str, tuple[types.FunctionType
             return {**st, "mtime": max(st["mtime"], stat(__file__).st_mtime)}
 
     STUBS = files(__name__) / "_stubs"
+    out = {}
     with as_file(STUBS / "_typeshed" / "__init__.pyi") as path:
         spec = spec_from_loader(
             "_typeshed", PyiLoader("_typeshed", str(path)), is_package=True
@@ -373,15 +389,44 @@ def _builtin_overloads() -> types.MappingProxyType[str, tuple[types.FunctionType
         sys.modules["_typeshed"] = mod = module_from_spec(spec)
         try:
             spec.loader.exec_module(mod)
-            out = OverloadCollector().collect(
-                ast.parse((STUBS / "builtins.pyi").read_bytes()),
-                {"__name__": "builtins"},
-            )
+            for stub, module in (
+                ("builtins.pyi", builtins),
+                ("_collections_abc.pyi", _collections_abc),
+                ("typing.pyi", tp),
+            ):
+                collected = OverloadCollector(module).collect(
+                    ast.parse((STUBS / stub).read_bytes())
+                )
+                for qualname, ovs in collected.items():
+                    head, sep, name = qualname.partition(".")
+                    if not sep:
+                        owner, name = module, head
+                    else:
+                        owner = vars(module).get(head)
+                        owner = tp.get_origin(owner) or owner
+                        if not isinstance(owner, type):
+                            continue
+                    out.setdefault(owner, {})[name] = tuple(ovs.values())
         finally:
             del sys.modules["_typeshed"]
     return types.MappingProxyType(
-        {qualname: tuple(ovs.values()) for qualname, ovs in out["builtins"].items()}
+        {owner: types.MappingProxyType(d) for owner, d in out.items()}
     )
+
+
+@ft.cache
+def _stub_functions() -> (
+    types.MappingProxyType[types.FunctionType, tuple[types.FunctionType, ...]]
+):
+    """Map runtime Python functions to their stub overloads."""
+    out = {}
+    for owner, members in _stub_overloads().items():
+        for name, ovs in members.items():
+            attr = vars(owner).get(name)
+            # unwrap __func__ from a classmethod or staticmethod
+            if isinstance(func := getattr(attr, "__func__", attr), types.FunctionType):
+                out[func] = ovs
+    return types.MappingProxyType(out)
 
 
 def _resolve_call(obj, /) -> tuple[tp.Sequence[tp.Callable], bool]:
@@ -391,10 +436,8 @@ def _resolve_call(obj, /) -> tuple[tp.Sequence[tp.Callable], bool]:
 
     def lookup(mro, /, *names: str):
         for cls in mro:
-            if getattr(builtins, cls.__name__, None) is cls:
-                ov_d = _builtin_overloads()
-                keys = (f"{cls.__qualname__}.{name}" for name in names)
-                decls = [ov_d[key] for key in keys if key in ov_d]
+            if (members := _stub_overloads().get(cls)) is not None:
+                decls = [members[name] for name in names if name in members]
             else:
                 attrs = (vars(cls)[name] for name in names if name in vars(cls))
                 decls = [
@@ -411,16 +454,18 @@ def _resolve_call(obj, /) -> tuple[tp.Sequence[tp.Callable], bool]:
 
     objtype = type(obj)
     if isinstance(obj, types.FunctionType) or hasattr(objtype, "__func__"):
-        return tp.get_overloads(obj), hasattr(objtype, "__self__")
+        ovs = tp.get_overloads(obj) or _stub_functions().get(
+            getattr(obj, "__func__", obj), ()
+        )
+        return ovs, hasattr(objtype, "__self__")
     if hasattr(objtype, "__self__"):
         # __self__ is None for C static methods, so get the module name
         # or self type from __reduce__ instead.
         match obj.__reduce__():
             case str(name):
                 # sys.modules[obj.__module__][name] => function
-                if obj.__module__ == builtins.__name__:
-                    return _builtin_overloads().get(name, ()), False
-                return (), False
+                members = _stub_overloads().get(sys.modules.get(obj.__module__), {})
+                return members.get(name, ()), False
             case _, (m_self, name):
                 # getattr(m_self, name) => unbound method
                 if isinstance(m_self, type):
