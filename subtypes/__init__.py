@@ -162,6 +162,7 @@ class _Variance(enum.Enum):
 class _AssignContext(tp.TypedDict):
     assuming: frozenset[tuple[subtype, tp.Any]]
     assumed_variance: tp.Mapping[type, _Variance]
+    self_class: tp.Any
 
 
 class _checker(abc.ABC):
@@ -364,6 +365,7 @@ def _infer_variance(
             lower,
             assuming=frozenset(),
             assumed_variance={**assumed_variance, typx: _Variance.COVARIANT},
+            self_class=typx,
         ):
             out[param] = _Variance.COVARIANT
         elif _assign_class_to_self(
@@ -371,6 +373,7 @@ def _infer_variance(
             upper,
             assuming=frozenset(),
             assumed_variance={**assumed_variance, typx: _Variance.CONTRAVARIANT},
+            self_class=typx,
         ):
             out[param] = _Variance.CONTRAVARIANT
         else:
@@ -536,6 +539,13 @@ class subtype(type):
                 namespace[s_check] = lambda src, **ctx: _assign_type(
                     resolved(), src, **ctx
                 )
+            case tp.Self:  # type: ignore
+                namespace[i_check] = lambda obj, **ctx: mcls(
+                    ctx["self_class"]
+                ).__subtype_instancecheck__(obj, **ctx)
+                namespace[s_check] = lambda src, **ctx: _assign_type(
+                    mcls(ctx["self_class"]), src, **ctx
+                )
             case tp.NewType():
                 supertype = mcls(typx.__supertype__)
                 namespace[i_check] = lambda obj, **ctx: (
@@ -562,11 +572,16 @@ class subtype(type):
 
     def __instancecheck__(cls, obj, /):
         return cls.__subtype_instancecheck__(
-            obj, assuming=frozenset(), assumed_variance={}
+            obj,
+            assuming=frozenset(),
+            assumed_variance={},
+            self_class=getattr(obj, "__dict__", {}).get("__orig_class__", type(obj)),
         )
 
     def __subclasscheck__(cls, src, /):
-        return _assign_type(cls, src, assuming=frozenset(), assumed_variance={})
+        return _assign_type(
+            cls, src, assuming=frozenset(), assumed_variance={}, self_class=src
+        )
 
 
 def _assign_type(dst: subtype, src, /, **ctx: tp.Unpack[_AssignContext]) -> bool:
@@ -594,6 +609,8 @@ def _assign_type(dst: subtype, src, /, **ctx: tp.Unpack[_AssignContext]) -> bool
             return _assign_type(dst, _evaluate(src), **ctx)
         case tp.NewType():
             return _assign_type(dst, src.__supertype__, **ctx)
+        case tp.Self:
+            return _assign_type(dst, ctx["self_class"], **ctx)
         case tp.TypeVar():
             if src.__constraints__:
                 return all(_assign_type(dst, c, **ctx) for c in src.__constraints__)
