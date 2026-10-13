@@ -35,50 +35,35 @@ def _unpack_tuple_items(typx, /) -> tuple[tp.Any, ...]:
     if tp.get_origin(typx) is tp.Unpack and not tp.is_typeddict(
         tup := tp.get_args(typx)[0]
     ):
-        typx = tup
+        if tp.get_origin(tup) is tuple:
+            # Unpack[Tuple[...]] => *tuple[...]
+            [typx] = tuple[*tp.get_args(tup)]
+        else:
+            typx = tup
     if _is_unpacked(typx) and not _is_indeterminate_tuple(typx):
         return tp.get_args(typx)
     return (typx,)
 
 
-def _get_tuple_arg_indices(
-    typx: type[tuple], /
-) -> tuple[
-    tuple[tuple[tp.Any, ...] | tp.Any, slice[int | None, int | None, None]], ...
-]:
-    args = tp.get_args(typx)
-    idx = next(
-        (
-            i
-            for i, x in enumerate(args)
-            if _is_unpacked(x) and _is_indeterminate_tuple(x)
-        ),
-        None,
-    )
-    if idx is None:
-        out = ((args, slice(None)),)
-    else:
-        # the tuple generic alias is bisected by an unpacked tuple of
-        # indefinite length.
-        [t_indef, _] = tp.get_args(args[idx])
-        if 0 < idx < len(args) - 1:
-            head, tail = args[:idx], args[idx + 1 :]
-            ni = len(head)
-            nj = len(tail)
-            out = (
-                (head, slice(ni)),
-                (t_indef, slice(ni, -nj)),
-                (tail, slice(-nj, None)),
-            )
-        elif idx == 0:
-            tail = args[idx + 1 :]
-            n = len(tail)
-            out = (t_indef, slice(-n)), (tail, slice(-n, None))
-        else:
-            head = args[:idx]
-            n = len(head)
-            out = (head, slice(n)), (t_indef, slice(n, None))
-    return out
+def _tuple_entries(typx: type[tuple], /) -> list[tuple[tp.Any, bool]] | None:
+    """Return the element types of typx, each paired with whether it is
+    indeterminate, or None if typx unpacks a TypeVarTuple.
+    """
+    if not hasattr(typx, "__args__"):
+        # a bare tuple takes the bound of its type parameter
+        return [(object, True)]
+    if _is_indeterminate_tuple(typx):
+        return [(tp.get_args(typx)[0], True)]
+    entries = []
+    for arg in tp.get_args(typx):
+        for x in _unpack_tuple_items(arg):
+            if isinstance(x, tp.TypeVarTuple):
+                return
+            if _is_unpacked(x) and _is_indeterminate_tuple(x):
+                entries.append((tp.get_args(x)[0], True))
+            else:
+                entries.append((x, False))
+    return entries
 
 
 def _add_default_params(
@@ -284,6 +269,15 @@ def _generic_bases(typx: type, /) -> tuple[tuple[_TypeParameter, ...], tuple]:
     """Return the type parameters and generic bases of typx."""
     if (bases := vars(typx).get("__orig_bases__")) is None:
         bases = _stub_bases().get(typx, typx.__bases__)
+    if "_fields" in vars(typx) and builtins.tuple in typx.__bases__:
+        # a namedtuple's tuple base has one element per field
+        annotations = annotationlib.get_annotations(
+            typx, format=annotationlib.Format.FORWARDREF
+        )
+        tuple_base = tuple[*(annotations.get(f, tp.Any) for f in typx._fields)]
+        bases = tuple(
+            tuple_base if b in (builtins.tuple, tp.NamedTuple) else b for b in bases
+        )
     for base in bases:
         if tp.get_origin(base) in (tp.Generic, tp.Protocol):
             return tp.get_args(base), bases
@@ -294,28 +288,83 @@ def _generic_bases(typx: type, /) -> tuple[tuple[_TypeParameter, ...], tuple]:
     return tuple(dict.fromkeys(params)), bases
 
 
-def _map_args(src, dst: type, /, *, erased: bool) -> dict[tp.TypeVar, tp.Any] | None:
-    """Map the type parameters of dst to the arguments src passes to them, or
-    return None if no generic base of src leads to dst.
+def _type_args(
+    typx, params: tuple[_TypeParameter, ...], /, *, erased: bool
+) -> dict[tp.TypeVar, tp.Any] | None:
+    """Map the type parameters of typx's origin to the arguments typx passes
+    to them, or return None if a parameter is not a TypeVar.
     """
-    src_origin = tp.get_origin(src) or src
-    params, bases = _generic_bases(src_origin)
-    args = tp.get_args(src)
+    args = tp.get_args(typx)
+    if tp.get_origin(typx) is builtins.tuple and hasattr(typx, "__args__"):
+        if (entries := _tuple_entries(typx)) is None:
+            return
+        # the type parameter of tuple is the union of its elements
+        args = (tp.Union[*(t for t, _ in entries)] if entries else tp.Never,)
     subst: dict[tp.TypeVar, tp.Any] = {}
     for i, param in enumerate(params):
         if not isinstance(param, tp.TypeVar):
             return
         arg = args[i] if i < len(args) else _default_arg(param, erased=erased)
         subst[param] = tp.Any if arg is ... else arg
-    if src_origin is dst:
-        return subst
-    for base in bases:
-        origin = tp.get_origin(base) or base
-        if origin in (tp.Generic, tp.Protocol) or not isinstance(origin, type):
+    return subst
+
+
+def _specialize(src, dst: type, /, *, erased: bool):
+    """Return the base of src whose origin is dst, with the type arguments of
+    src substituted, or None if no generic base of src leads to dst.
+    """
+    stack: list[tuple[tp.Any, tp.Mapping]] = [(src, {})]
+    while stack:
+        typx, subst = stack.pop()
+        origin = tp.get_origin(typx) or typx
+        if origin is dst:
+            return _substitute(typx, subst)
+        # a base that is not a subclass of dst cannot lead to it
+        if not (isinstance(origin, type) and issubclass(origin, dst)):
             continue
-        base = _substitute(base, subst)
-        if (mapped := _map_args(base, dst, erased=erased)) is not None:
-            return mapped
+        params, bases = _generic_bases(origin)
+        if (args := _type_args(typx, params, erased=erased)) is None:
+            continue
+        # map the type parameters of origin to the arguments of src
+        subst = {p: _substitute(a, subst) for p, a in args.items()}
+        stack += [(base, subst) for base in bases[::-1]]
+
+
+def _map_args(src, dst: type, /, *, erased: bool) -> dict[tp.TypeVar, tp.Any] | None:
+    """Map the type parameters of dst to the arguments src passes to them, or
+    return None if no generic base of src leads to dst.
+    """
+    if (base := _specialize(src, dst, erased=erased)) is not None:
+        params, _ = _generic_bases(dst)
+        return _type_args(base, params, erased=erased)
+
+
+def _adjust_tuple_entries(
+    dst: list[tuple[tp.Any, bool]], src: list[tuple[tp.Any, bool]], /
+) -> bool:
+    """Pack the src entries that match the indeterminate entry of dst into one,
+    and return whether dst and src then have the same length.
+    """
+    dst_i = next((i for i, (_, indeterminate) in enumerate(dst) if indeterminate), -1)
+    src_i = next((i for i, (_, indeterminate) in enumerate(src) if indeterminate), -1)
+    if src_i >= 0:
+        if src[src_i][0] is tp.Any:
+            # an indeterminate Any expands to the length of dst
+            while len(src) < len(dst):
+                src.insert(src_i, src[src_i])
+            if len(src) > len(dst):
+                del src[src_i]
+                src_i = -1
+        elif dst_i < 0:
+            return False
+    if dst_i >= 0 and dst[dst_i][0] is tp.Any:
+        while len(dst) < len(src):
+            dst.insert(dst_i, dst[dst_i])
+    n = len(src) - len(dst) + 1
+    if dst_i >= 0 and n >= 0 and (src_i < 0 or dst_i <= src_i < dst_i + n):
+        packed = [t for t, _ in src[dst_i : dst_i + n]]
+        src[dst_i : dst_i + n] = [(tp.Union[*packed] if packed else tp.Any, False)]
+    return len(dst) == len(src)
 
 
 def _substitute(typx, subst: tp.Mapping, /):
@@ -491,6 +540,50 @@ class _generic_subclasscheck(_generic_instancecheck):
         return _assign_generic(self.__form__, obj, **ctx)
 
 
+def _assign_tuple(dst, src, /, **ctx: tp.Unpack[_AssignContext]) -> bool:
+    origin = tp.get_origin(src) or src
+    if not (isinstance(origin, type) and issubclass(origin, builtins.tuple)):
+        return False
+    base = _specialize(src, builtins.tuple, erased=False)
+    if (
+        base is None
+        or (src_entries := _tuple_entries(base)) is None
+        or (dst_entries := _tuple_entries(dst)) is None
+    ):
+        return True
+    if not _adjust_tuple_entries(dst_entries, src_entries):
+        return False
+    return all(
+        _assign_with_variance(d, s, _Variance.COVARIANT, **ctx)
+        for (d, _), (s, _) in zip(dst_entries, src_entries)
+    )
+
+
+class _tuple_instancecheck(_checker):
+    def __init__(self, typx: type[tuple], /):
+        self.__form__ = typx
+
+    def __call__(self, obj, /, **ctx):
+        if not isinstance(obj, builtins.tuple):
+            return False
+        if (entries := _tuple_entries(self.__form__)) is None:
+            return True
+        ts = [t for t, _ in entries]
+        i = next(
+            (i for i, (_, indeterminate) in enumerate(entries) if indeterminate), None
+        )
+        if i is not None:
+            ts[i : i + 1] *= len(obj) - len(entries) + 1
+        return len(ts) == len(obj) and all(
+            subtype(t).__subtype_instancecheck__(v, **ctx) for t, v in zip(ts, obj)
+        )
+
+
+class _tuple_subclasscheck(_tuple_instancecheck):
+    def __call__(self, obj, /, **ctx):
+        return _assign_tuple(self.__form__, obj, **ctx)
+
+
 _subtypes = weakref.WeakValueDictionary()
 _inferred_variance = weakref.WeakKeyDictionary()
 
@@ -553,10 +646,14 @@ class subtype(type):
                 )
                 # _assign_type admits typx and the NewTypes derived from it
                 namespace[s_check] = lambda _, **ctx: False
+            # tuple[()] has no arguments but is not the bare tuple class
+            case builtins.tuple if hasattr(typx, "__args__"):
+                namespace[i_check] = _tuple_instancecheck(typx)
+                namespace[s_check] = _tuple_subclasscheck(typx)
             case type() if not tp.get_args(typx):
                 namespace[i_check] = _nominal_instancecheck(typx)
                 namespace[s_check] = _nominal_subclasscheck(typx)
-            case collections.abc.Callable | builtins.tuple | builtins.type:
+            case collections.abc.Callable | builtins.type:
                 raise NotImplementedError
             case type():
                 namespace[i_check] = _generic_instancecheck(typx)
