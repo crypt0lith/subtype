@@ -780,8 +780,11 @@ class subtype(type):
             case type():
                 namespace[i_check] = _generic_instancecheck(typx)
                 namespace[s_check] = _generic_subclasscheck(typx)
-            case _:
+            # TODO: implement these
+            case tp.TypeVar() | str() | tp.LiteralString | tp.TypeGuard | tp.TypeIs:
                 raise NotImplementedError
+            case _:
+                raise TypeError
         return _subtypes.setdefault(
             typx, super().__new__(mcls, mcls.__name__, (), namespace)
         )
@@ -801,6 +804,10 @@ class subtype(type):
         return _assign_type(
             cls, src, assuming=frozenset(), assumed_variance={}, self_class=src
         )
+
+    @tp.final
+    def __call__(cls) -> tp.Never:
+        raise TypeError(f"cannot instantiate {type(cls).__qualname__} objects")
 
 
 def _assign_type(dst: subtype, src, /, **ctx: tp.Unpack[_AssignContext]) -> bool:
