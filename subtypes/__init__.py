@@ -66,6 +66,34 @@ def _tuple_entries(typx: type[tuple], /) -> list[tuple[tp.Any, bool]] | None:
     return entries
 
 
+def _adjust_tuple_entries(
+    dst: list[tuple[tp.Any, bool]], src: list[tuple[tp.Any, bool]], /
+) -> bool:
+    """Pack the src entries that match the indeterminate entry of dst into one,
+    and return whether dst and src then have the same length.
+    """
+    dst_i = next((i for i, (_, indeterminate) in enumerate(dst) if indeterminate), -1)
+    src_i = next((i for i, (_, indeterminate) in enumerate(src) if indeterminate), -1)
+    if src_i >= 0:
+        if src[src_i][0] is tp.Any:
+            # an indeterminate Any expands to the length of dst
+            while len(src) < len(dst):
+                src.insert(src_i, src[src_i])
+            if len(src) > len(dst):
+                del src[src_i]
+                src_i = -1
+        elif dst_i < 0:
+            return False
+    if dst_i >= 0 and dst[dst_i][0] is tp.Any:
+        while len(dst) < len(src):
+            dst.insert(dst_i, dst[dst_i])
+    n = len(src) - len(dst) + 1
+    if dst_i >= 0 and n >= 0 and (src_i < 0 or dst_i <= src_i < dst_i + n):
+        packed = [t for t, _ in src[dst_i : dst_i + n]]
+        src[dst_i : dst_i + n] = [(tp.Union[*packed] if packed else tp.Any, False)]
+    return len(dst) == len(src)
+
+
 def _add_default_params(
     src_param_lst: tuple[_TypeParameter, ...], dst_params: dict[_TypeParameter, tp.Any]
 ):
@@ -682,34 +710,6 @@ def _map_args(src, dst: type, /, *, erased: bool) -> dict[tp.TypeVar, tp.Any] | 
     if (base := _specialize(src, dst, erased=erased)) is not None:
         params, _ = _generic_bases(dst)
         return _type_args(base, params, erased=erased)
-
-
-def _adjust_tuple_entries(
-    dst: list[tuple[tp.Any, bool]], src: list[tuple[tp.Any, bool]], /
-) -> bool:
-    """Pack the src entries that match the indeterminate entry of dst into one,
-    and return whether dst and src then have the same length.
-    """
-    dst_i = next((i for i, (_, indeterminate) in enumerate(dst) if indeterminate), -1)
-    src_i = next((i for i, (_, indeterminate) in enumerate(src) if indeterminate), -1)
-    if src_i >= 0:
-        if src[src_i][0] is tp.Any:
-            # an indeterminate Any expands to the length of dst
-            while len(src) < len(dst):
-                src.insert(src_i, src[src_i])
-            if len(src) > len(dst):
-                del src[src_i]
-                src_i = -1
-        elif dst_i < 0:
-            return False
-    if dst_i >= 0 and dst[dst_i][0] is tp.Any:
-        while len(dst) < len(src):
-            dst.insert(dst_i, dst[dst_i])
-    n = len(src) - len(dst) + 1
-    if dst_i >= 0 and n >= 0 and (src_i < 0 or dst_i <= src_i < dst_i + n):
-        packed = [t for t, _ in src[dst_i : dst_i + n]]
-        src[dst_i : dst_i + n] = [(tp.Union[*packed] if packed else tp.Any, False)]
-    return len(dst) == len(src)
 
 
 def _assign_type(dst: subtype, src, /, **ctx: tp.Unpack[_AssignContext]) -> bool:
