@@ -17,12 +17,10 @@ class Q[T](tp.NamedTuple):
     y: int
 
 
-class Pair(tuple[int, str]):
-    pass
+class Pair(tuple[int, str]): ...
 
 
-class Ints[T](tuple[T, ...]):
-    pass
+class Ints[T](tuple[T, ...]): ...
 
 
 R = collections.namedtuple("R", "a b")

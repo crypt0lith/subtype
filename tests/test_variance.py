@@ -53,16 +53,13 @@ class NT[T](tp.NamedTuple):
     item: T
 
 
-class SubAttr[T](Attr[T]):
-    pass
+class SubAttr[T](Attr[T]): ...
 
 
-class SubSeq[T](collections.abc.Sequence[T]):
-    pass
+class SubSeq[T](collections.abc.Sequence[T]): ...
 
 
-class SubGetter[T](Getter[T]):
-    pass
+class SubGetter[T](Getter[T]): ...
 
 
 class Cyc1[T]:

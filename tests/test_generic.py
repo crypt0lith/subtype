@@ -7,32 +7,26 @@ from subtypes import subtype
 
 
 class A(collections.abc.Iterable[int]):
-    def __iter__(self):
-        return iter(())
+    def __iter__(self): ...
 
 
 class B[T: int](collections.abc.Iterable[T]):
-    def __iter__(self):
-        return iter(())
+    def __iter__(self): ...
 
 
 class G[T = int](collections.abc.Iterable[T]):
-    def __iter__(self):
-        return iter(())
+    def __iter__(self): ...
 
 
-class IntList(list[int]):
-    pass
+class IntList(list[int]): ...
 
 
 class BareIterable(collections.abc.Iterable):
-    def __iter__(self):
-        return iter(())
+    def __iter__(self): ...
 
 
 class Box[T]:
-    def __init__(self, item=None):
-        self.item = item
+    def __init__(self, item=None): ...
 
 
 type Ints = list[int]
