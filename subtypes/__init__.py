@@ -68,8 +68,10 @@ def _adjust_tuple_entries(
     """Pack the src entries that match the indeterminate entry of dst into one,
     and return whether dst and src then have the same length.
     """
-    dst_i = next((i for i, (_, indeterminate) in enumerate(dst) if indeterminate), -1)
-    src_i = next((i for i, (_, indeterminate) in enumerate(src) if indeterminate), -1)
+    dst_i, src_i = (
+        next((i for i, (_, indeterminate) in enumerate(x) if indeterminate), -1)
+        for x in (dst, src)
+    )
     if src_i >= 0:
         if src[src_i][0] is tp.Any:
             # an indeterminate Any expands to the length of dst
@@ -790,8 +792,7 @@ def _assign_class_to_self(
     dst: _SupportsGeneric, src: _SupportsGeneric, /, **ctx: tp.Unpack[_AssignContext]
 ) -> bool:
     params, _ = _generic_bases(dst.__origin__)
-    dst_subst = dict(zip(params, dst.__args__))
-    src_subst = dict(zip(params, src.__args__))
+    dst_subst, src_subst = (dict(zip(params, x.__args__)) for x in (dst, src))
     return all(
         _assign_with_variance(
             _substitute(form, dst_subst), _substitute(form, src_subst), variance, **ctx
@@ -809,12 +810,14 @@ def _infer_variance(
 ) -> dict[tp.TypeVar, _Variance]:
     params, _ = _generic_bases(typx)
     out = {}
-    for param in params:
+    for i, param in enumerate(params):
         if not (isinstance(param, tp.TypeVar) and param.__infer_variance__):
             continue
-        bound = types.new_class(param.__name__)
-        upper = typx[*(object if p is param else _VarianceDummy for p in params)]
-        lower = typx[*(bound if p is param else _VarianceDummy for p in params)]
+        bounds: list[type[tp.Any]] = [object, types.new_class(param.__name__)]
+        bound_args = [[_VarianceDummy] * len(params) for _ in range(len(bounds))]
+        for x, args in zip(bounds, bound_args):
+            args[i] = x
+        upper, lower = (typx[*b] for b in bound_args)
         # references to typx in its members compare by the assumed variance
         if _assign_class_to_self(
             upper,
@@ -856,7 +859,7 @@ def _variance(
 
 
 class _literal_instancecheck(_checker):
-    def __call__(self, obj, /, **ctx):
+    def __call__(self, obj, /, **__):
         # Literal[1] excludes True
         return any(type(obj) is type(a) and obj == a for a in self.__args__)
 
@@ -875,7 +878,7 @@ class _nominal_instancecheck(_checker):
     def __init__(self, typx: type, /):
         self.__args__ = _PROMOTIONS.get(typx, (typx,))
 
-    def __call__(self, obj, /, **ctx):
+    def __call__(self, obj, /, **__):
         return isinstance(obj, self.__args__)
 
 
@@ -1107,11 +1110,11 @@ class subtype(type):
                 return mcls(typx.__origin__)
             case tp.Any:
                 namespace.update(
-                    dict.fromkeys((i_check, s_check), lambda _, **ctx: True)
+                    dict.fromkeys((i_check, s_check), lambda _, **__: True)
                 )
             case tp.Never | tp.NoReturn:
                 namespace.update(
-                    dict.fromkeys((i_check, s_check), lambda _, **ctx: False)
+                    dict.fromkeys((i_check, s_check), lambda _, **__: False)
                 )
             case tp.Literal:
                 namespace[i_check] = _literal_instancecheck(typx)
@@ -1146,7 +1149,7 @@ class subtype(type):
                     supertype.__subtype_instancecheck__(obj, **ctx)
                 )
                 # _assign_type admits typx and the NewTypes derived from it
-                namespace[s_check] = lambda _, **ctx: False
+                namespace[s_check] = lambda _, **__: False
             # tuple[()] has no arguments but is not the bare tuple class
             case builtins.tuple if hasattr(typx, "__args__"):
                 namespace[i_check] = _tuple_instancecheck(typx)
