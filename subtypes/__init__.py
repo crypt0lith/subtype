@@ -828,6 +828,52 @@ def _declared_types(typx: type, /) -> list[tuple[tp.Any, _Variance]]:
     return out
 
 
+def _assign_type(dst: subtype, src, /, **ctx: tp.Unpack[_AssignContext]) -> bool:
+    if src == dst.__subtype_form__:
+        return True
+    match tp.get_origin(src) or src:
+        case None:
+            return _assign_type(dst, types.NoneType, **ctx)
+        case tp.Any | tp.Never | tp.NoReturn:
+            return True
+        case tp.Union:
+            return all(_assign_type(dst, arg, **ctx) for arg in src.__args__)
+        case tp.Literal if len(src.__args__) > 1:
+            # a union dst can accept each value from a different member
+            return all(
+                _assign_type(dst, tp.Literal[arg], **ctx) for arg in src.__args__
+            )
+        case tp.Annotated:
+            return _assign_type(dst, src.__origin__, **ctx)
+        case tp.TypeAliasType() | tp.ForwardRef():
+            # a recursive alias reaches the same pair again, which then holds
+            if (dst, src) in ctx["assuming"]:
+                return True
+            ctx["assuming"] |= {(dst, src)}
+            return _assign_type(dst, _evaluate(src), **ctx)
+        case tp.NewType():
+            return _assign_type(dst, src.__supertype__, **ctx)
+        case tp.Self:
+            return _assign_type(dst, ctx["self_class"], **ctx)
+        case tp.TypeVar():
+            if src.__constraints__:
+                return all(_assign_type(dst, c, **ctx) for c in src.__constraints__)
+            return _assign_type(dst, src.__bound__ or object, **ctx)
+        case builtins.type if tp.get_args(src):
+            [arg] = tp.get_args(src)
+            # type[...] distributes over a union, and takes the bound or
+            # constraints of a TypeVar
+            if tp.get_origin(arg) is tp.Union:
+                return all(_assign_type(dst, type[a], **ctx) for a in arg.__args__)
+            if isinstance(arg, tp.TypeVar):
+                if arg.__constraints__:
+                    return all(
+                        _assign_type(dst, type[c], **ctx) for c in arg.__constraints__
+                    )
+                return _assign_type(dst, type[arg.__bound__ or object], **ctx)
+    return dst.__subtype_subclasscheck__(src, **ctx)
+
+
 def _assign_with_variance(
     dst, src, variance: _Variance, /, **ctx: tp.Unpack[_AssignContext]
 ) -> bool:
@@ -1145,49 +1191,3 @@ class subtype(type):
     @tp.final
     def __call__(cls) -> tp.Never:
         raise TypeError(f"cannot instantiate {type(cls).__qualname__} objects")
-
-
-def _assign_type(dst: subtype, src, /, **ctx: tp.Unpack[_AssignContext]) -> bool:
-    if src == dst.__subtype_form__:
-        return True
-    match tp.get_origin(src) or src:
-        case None:
-            return _assign_type(dst, types.NoneType, **ctx)
-        case tp.Any | tp.Never | tp.NoReturn:
-            return True
-        case tp.Union:
-            return all(_assign_type(dst, arg, **ctx) for arg in src.__args__)
-        case tp.Literal if len(src.__args__) > 1:
-            # a union dst can accept each value from a different member
-            return all(
-                _assign_type(dst, tp.Literal[arg], **ctx) for arg in src.__args__
-            )
-        case tp.Annotated:
-            return _assign_type(dst, src.__origin__, **ctx)
-        case tp.TypeAliasType() | tp.ForwardRef():
-            # a recursive alias reaches the same pair again, which then holds
-            if (dst, src) in ctx["assuming"]:
-                return True
-            ctx["assuming"] |= {(dst, src)}
-            return _assign_type(dst, _evaluate(src), **ctx)
-        case tp.NewType():
-            return _assign_type(dst, src.__supertype__, **ctx)
-        case tp.Self:
-            return _assign_type(dst, ctx["self_class"], **ctx)
-        case tp.TypeVar():
-            if src.__constraints__:
-                return all(_assign_type(dst, c, **ctx) for c in src.__constraints__)
-            return _assign_type(dst, src.__bound__ or object, **ctx)
-        case builtins.type if tp.get_args(src):
-            [arg] = tp.get_args(src)
-            # type[...] distributes over a union, and takes the bound or
-            # constraints of a TypeVar
-            if tp.get_origin(arg) is tp.Union:
-                return all(_assign_type(dst, type[a], **ctx) for a in arg.__args__)
-            if isinstance(arg, tp.TypeVar):
-                if arg.__constraints__:
-                    return all(
-                        _assign_type(dst, type[c], **ctx) for c in arg.__constraints__
-                    )
-                return _assign_type(dst, type[arg.__bound__ or object], **ctx)
-    return dst.__subtype_subclasscheck__(src, **ctx)
