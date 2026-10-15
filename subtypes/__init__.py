@@ -239,7 +239,7 @@ class _Variance(enum.Enum):
     CONTRAVARIANT = enum.auto()
 
 
-class _AssignContext(tp.TypedDict):
+class _AssignContext(tp.TypedDict, total=False):
     assuming: frozenset[tuple[subtype, tp.Any]]
     assumed_variance: tp.Mapping[type, _Variance]
     self_class: tp.Any
@@ -599,7 +599,9 @@ def _generic_bases(typx: type, /) -> tuple[tuple[_TypeParameter, ...], tuple]:
         annotations = annotationlib.get_annotations(
             typx, format=annotationlib.Format.FORWARDREF
         )
-        tuple_base = tuple[*(annotations.get(f, tp.Any) for f in typx._fields)]
+        tuple_base = tuple.__class_getitem__(
+            tuple(annotations.get(f, tp.Any) for f in typx._fields)
+        )
         bases = tuple(
             tuple_base if b in (builtins.tuple, tp.NamedTuple) else b for b in bases
         )
@@ -701,6 +703,8 @@ def _assign_type(dst: subtype, src, /, **ctx: tp.Unpack[_AssignContext]) -> bool
         case tp.Annotated:
             return _assign_type(dst, src.__origin__, **ctx)
         case tp.TypeAliasType() | tp.ForwardRef():
+            if "assuming" not in ctx:
+                ctx["assuming"] = frozenset()
             # a recursive alias reaches the same pair again, which then holds
             if (dst, src) in ctx["assuming"]:
                 return True
@@ -709,7 +713,7 @@ def _assign_type(dst: subtype, src, /, **ctx: tp.Unpack[_AssignContext]) -> bool
         case tp.NewType():
             return _assign_type(dst, src.__supertype__, **ctx)
         case tp.Self:
-            return _assign_type(dst, ctx["self_class"], **ctx)
+            return _assign_type(dst, ctx.get("self_class", object), **ctx)
         case tp.TypeVar():
             if src.__constraints__:
                 return all(_assign_type(dst, c, **ctx) for c in src.__constraints__)
@@ -806,8 +810,10 @@ class _VarianceDummy:
 
 
 def _infer_variance(
-    typx, /, *, assumed_variance: tp.Mapping[type, _Variance]
+    typx, /, *, assumed_variance: tp.Mapping[type, _Variance] | None = None
 ) -> dict[tp.TypeVar, _Variance]:
+    if assumed_variance is None:
+        assumed_variance = {}
     params, _ = _generic_bases(typx)
     out = {}
     for i, param in enumerate(params):
@@ -822,7 +828,6 @@ def _infer_variance(
         if _assign_class_to_self(
             upper,
             lower,
-            assuming=frozenset(),
             assumed_variance={**assumed_variance, typx: _Variance.COVARIANT},
             self_class=typx,
         ):
@@ -830,7 +835,6 @@ def _infer_variance(
         elif _assign_class_to_self(
             lower,
             upper,
-            assuming=frozenset(),
             assumed_variance={**assumed_variance, typx: _Variance.CONTRAVARIANT},
             self_class=typx,
         ):
@@ -841,8 +845,14 @@ def _infer_variance(
 
 
 def _variance(
-    typx: type, param: tp.TypeVar, /, *, assumed_variance: tp.Mapping[type, _Variance]
+    typx: type,
+    param: tp.TypeVar,
+    /,
+    *,
+    assumed_variance: tp.Mapping[type, _Variance] | None = None,
 ) -> _Variance:
+    if assumed_variance is None:
+        assumed_variance = {}
     if (assumed := assumed_variance.get(typx)) is not None:
         return assumed
     if param.__covariant__:
@@ -902,7 +912,7 @@ def _assign_generic(
         _assign_with_variance(
             dst_arg,
             src_args[p],
-            _variance(dst.__origin__, p, assumed_variance=ctx["assumed_variance"]),
+            _variance(dst.__origin__, p, assumed_variance=ctx.get("assumed_variance")),
             **ctx,
         )
         for p, dst_arg in dst_args.items()
@@ -1138,10 +1148,10 @@ class subtype(type):
                 )
             case tp.Self:  # type: ignore
                 namespace[i_check] = lambda obj, **ctx: mcls(
-                    ctx["self_class"]
+                    ctx.get("self_class", tp.Any)
                 ).__subtype_instancecheck__(obj, **ctx)
                 namespace[s_check] = lambda src, **ctx: _assign_type(
-                    mcls(ctx["self_class"]), src, **ctx
+                    mcls(ctx.get("self_class", tp.Any)), src, **ctx
                 )
             case tp.NewType():
                 supertype = mcls(typx.__supertype__)
@@ -1181,15 +1191,11 @@ class subtype(type):
     def __instancecheck__(cls, obj, /):
         return cls.__subtype_instancecheck__(
             obj,
-            assuming=frozenset(),
-            assumed_variance={},
             self_class=getattr(obj, "__dict__", {}).get("__orig_class__", type(obj)),
         )
 
     def __subclasscheck__(cls, src, /):
-        return _assign_type(
-            cls, src, assuming=frozenset(), assumed_variance={}, self_class=src
-        )
+        return _assign_type(cls, src, self_class=src)
 
     @tp.final
     def __call__(cls) -> tp.Never:
