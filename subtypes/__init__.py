@@ -712,122 +712,6 @@ def _substitute(typx, subst: tp.Mapping, /):
     return typx
 
 
-class _VarianceDummy:
-    pass
-
-
-def _variance(
-    typx: type, param: tp.TypeVar, /, *, assumed_variance: tp.Mapping[type, _Variance]
-) -> _Variance:
-    if (assumed := assumed_variance.get(typx)) is not None:
-        return assumed
-    if param.__covariant__:
-        return _Variance.COVARIANT
-    if param.__contravariant__:
-        return _Variance.CONTRAVARIANT
-    if not param.__infer_variance__:
-        return _Variance.INVARIANT
-    if (variances := _inferred_variance.get(typx)) is None:
-        variances = _inferred_variance[typx] = _infer_variance(
-            typx, assumed_variance=assumed_variance
-        )
-    return variances[param]
-
-
-def _infer_variance(
-    typx, /, *, assumed_variance: tp.Mapping[type, _Variance]
-) -> dict[tp.TypeVar, _Variance]:
-    params, _ = _generic_bases(typx)
-    out = {}
-    for param in params:
-        if not (isinstance(param, tp.TypeVar) and param.__infer_variance__):
-            continue
-        bound = types.new_class(param.__name__)
-        upper = typx[*(object if p is param else _VarianceDummy for p in params)]
-        lower = typx[*(bound if p is param else _VarianceDummy for p in params)]
-        # references to typx in its members compare by the assumed variance
-        if _assign_class_to_self(
-            upper,
-            lower,
-            assuming=frozenset(),
-            assumed_variance={**assumed_variance, typx: _Variance.COVARIANT},
-            self_class=typx,
-        ):
-            out[param] = _Variance.COVARIANT
-        elif _assign_class_to_self(
-            lower,
-            upper,
-            assuming=frozenset(),
-            assumed_variance={**assumed_variance, typx: _Variance.CONTRAVARIANT},
-            self_class=typx,
-        ):
-            out[param] = _Variance.CONTRAVARIANT
-        else:
-            out[param] = _Variance.INVARIANT
-    return out
-
-
-def _assign_class_to_self(
-    dst: _SupportsGeneric, src: _SupportsGeneric, /, **ctx: tp.Unpack[_AssignContext]
-) -> bool:
-    params, _ = _generic_bases(dst.__origin__)
-    dst_subst = dict(zip(params, dst.__args__))
-    src_subst = dict(zip(params, src.__args__))
-    return all(
-        _assign_with_variance(
-            _substitute(form, dst_subst), _substitute(form, src_subst), variance, **ctx
-        )
-        for form, variance in _declared_types(dst.__origin__)
-    )
-
-
-def _declared_types(typx: type, /) -> list[tuple[tp.Any, _Variance]]:
-    """Return the types declared in the members and generic bases of typx,
-    each with the variance its assignment requires.
-    """
-    out = []
-    annotations = annotationlib.get_annotations(
-        typx, format=annotationlib.Format.FORWARDREF
-    )
-    for name, form in annotations.items():
-        final = False
-        while tp.get_origin(form) in (tp.ClassVar, tp.Final):
-            final |= tp.get_origin(form) is tp.Final
-            [form] = tp.get_args(form)
-        dunder = name.startswith("__") and name.endswith("__")
-        if final or (name.startswith("_") and not dunder):
-            out.append((form, _Variance.COVARIANT))
-        else:
-            # a frozen dataclass or NamedTuple field is replaceable by __replace__
-            out.append((form, _Variance.INVARIANT))
-    for name, attr in vars(typx).items():
-        if name in ("__new__", "__init__"):
-            continue
-        is_bound = not isinstance(attr, staticmethod)
-        if isinstance(attr, property):
-            funcs = (attr.fget, attr.fset, attr.fdel)
-        else:
-            funcs = (attr,)
-        for func in funcs:
-            func = getattr(func, "__func__", func)
-            if not isinstance(func, types.FunctionType):
-                continue
-            ovs = tp.get_overloads(func) or (func,)
-            for sig in _get_signatures(*ovs, is_bound=is_bound):
-                out += [
-                    (p.annotation, _Variance.CONTRAVARIANT)
-                    for p in sig.parameters.values()
-                ]
-                out.append((sig.return_annotation, _Variance.COVARIANT))
-    _, bases = _generic_bases(typx)
-    out += [
-        (base, _Variance.COVARIANT)
-        for base in bases
-        if tp.get_origin(base) not in (tp.Generic, tp.Protocol, builtins.tuple)
-    ]
-    return out
-
-
 def _assign_type(dst: subtype, src, /, **ctx: tp.Unpack[_AssignContext]) -> bool:
     if src == dst.__subtype_form__:
         return True
@@ -884,6 +768,122 @@ def _assign_with_variance(
     ):
         return False
     return variance is _Variance.COVARIANT or _assign_type(subtype(src), dst, **ctx)
+
+
+def _declared_types(typx: type, /) -> list[tuple[tp.Any, _Variance]]:
+    """Return the types declared in the members and generic bases of typx,
+    each with the variance its assignment requires.
+    """
+    out = []
+    annotations = annotationlib.get_annotations(
+        typx, format=annotationlib.Format.FORWARDREF
+    )
+    for name, form in annotations.items():
+        final = False
+        while tp.get_origin(form) in (tp.ClassVar, tp.Final):
+            final |= tp.get_origin(form) is tp.Final
+            [form] = tp.get_args(form)
+        dunder = name.startswith("__") and name.endswith("__")
+        if final or (name.startswith("_") and not dunder):
+            out.append((form, _Variance.COVARIANT))
+        else:
+            # a frozen dataclass or NamedTuple field is replaceable by __replace__
+            out.append((form, _Variance.INVARIANT))
+    for name, attr in vars(typx).items():
+        if name in ("__new__", "__init__"):
+            continue
+        is_bound = not isinstance(attr, staticmethod)
+        if isinstance(attr, property):
+            funcs = (attr.fget, attr.fset, attr.fdel)
+        else:
+            funcs = (attr,)
+        for func in funcs:
+            func = getattr(func, "__func__", func)
+            if not isinstance(func, types.FunctionType):
+                continue
+            ovs = tp.get_overloads(func) or (func,)
+            for sig in _get_signatures(*ovs, is_bound=is_bound):
+                out += [
+                    (p.annotation, _Variance.CONTRAVARIANT)
+                    for p in sig.parameters.values()
+                ]
+                out.append((sig.return_annotation, _Variance.COVARIANT))
+    _, bases = _generic_bases(typx)
+    out += [
+        (base, _Variance.COVARIANT)
+        for base in bases
+        if tp.get_origin(base) not in (tp.Generic, tp.Protocol, builtins.tuple)
+    ]
+    return out
+
+
+def _assign_class_to_self(
+    dst: _SupportsGeneric, src: _SupportsGeneric, /, **ctx: tp.Unpack[_AssignContext]
+) -> bool:
+    params, _ = _generic_bases(dst.__origin__)
+    dst_subst = dict(zip(params, dst.__args__))
+    src_subst = dict(zip(params, src.__args__))
+    return all(
+        _assign_with_variance(
+            _substitute(form, dst_subst), _substitute(form, src_subst), variance, **ctx
+        )
+        for form, variance in _declared_types(dst.__origin__)
+    )
+
+
+class _VarianceDummy:
+    pass
+
+
+def _infer_variance(
+    typx, /, *, assumed_variance: tp.Mapping[type, _Variance]
+) -> dict[tp.TypeVar, _Variance]:
+    params, _ = _generic_bases(typx)
+    out = {}
+    for param in params:
+        if not (isinstance(param, tp.TypeVar) and param.__infer_variance__):
+            continue
+        bound = types.new_class(param.__name__)
+        upper = typx[*(object if p is param else _VarianceDummy for p in params)]
+        lower = typx[*(bound if p is param else _VarianceDummy for p in params)]
+        # references to typx in its members compare by the assumed variance
+        if _assign_class_to_self(
+            upper,
+            lower,
+            assuming=frozenset(),
+            assumed_variance={**assumed_variance, typx: _Variance.COVARIANT},
+            self_class=typx,
+        ):
+            out[param] = _Variance.COVARIANT
+        elif _assign_class_to_self(
+            lower,
+            upper,
+            assuming=frozenset(),
+            assumed_variance={**assumed_variance, typx: _Variance.CONTRAVARIANT},
+            self_class=typx,
+        ):
+            out[param] = _Variance.CONTRAVARIANT
+        else:
+            out[param] = _Variance.INVARIANT
+    return out
+
+
+def _variance(
+    typx: type, param: tp.TypeVar, /, *, assumed_variance: tp.Mapping[type, _Variance]
+) -> _Variance:
+    if (assumed := assumed_variance.get(typx)) is not None:
+        return assumed
+    if param.__covariant__:
+        return _Variance.COVARIANT
+    if param.__contravariant__:
+        return _Variance.CONTRAVARIANT
+    if not param.__infer_variance__:
+        return _Variance.INVARIANT
+    if (variances := _inferred_variance.get(typx)) is None:
+        variances = _inferred_variance[typx] = _infer_variance(
+            typx, assumed_variance=assumed_variance
+        )
+    return variances[param]
 
 
 def _assign_generic(
