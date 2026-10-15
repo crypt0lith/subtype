@@ -183,8 +183,9 @@ class _ForwardRefSubscriptTransformer(ast.NodeTransformer):
             and node.value.id in self._ns
             and not hasattr(self._ns[node.value.id], "__class_getitem__")
         ):
-            # emit only the subscripted name
-            return node.value
+            return ast.Call(
+                ast.Name("__generic_alias__", ast.Load()), [node.value, node.slice], []
+            )
         return node
 
     @classmethod
@@ -211,6 +212,7 @@ class _ForwardRefSubscriptTransformer(ast.NodeTransformer):
                     locals.setdefault(cell_name, cell_value)
         if forwardref.__extra_names__:
             locals.update(forwardref.__extra_names__)
+        locals["__generic_alias__"] = types.GenericAlias
         if (node := forwardref.__ast_node__) is None:
             node = ast.parse(forwardref.__forward_arg__, mode="eval").body
         tree = ast.fix_missing_locations(
@@ -318,6 +320,7 @@ def _load_stubs():
                         "__name__": name,
                         "__builtins__": self._runtime,
                         "__stub_class__": self._register,
+                        "__generic_alias__": types.GenericAlias,
                     },
                 )
             finally:
@@ -434,6 +437,7 @@ def _load_stubs():
         assert spec is not None
         assert spec.loader is not None
         sys.modules["_typeshed"] = mod = module_from_spec(spec)
+        vars(mod)["__generic_alias__"] = types.GenericAlias
         try:
             spec.loader.exec_module(mod)
             for stub, module in (
@@ -615,6 +619,11 @@ def _generic_bases(typx: type, /) -> tuple[tuple[_TypeParameter, ...], tuple]:
     return tuple(dict.fromkeys(params)), bases
 
 
+def _is_protocol(typx: type, /) -> bool:
+    _, bases = _generic_bases(typx)
+    return any((tp.get_origin(b) or b) is tp.Protocol for b in bases)
+
+
 def _default_arg(param: tp.TypeVar, /, *, erased: bool):
     # a value's type arguments are erased at runtime
     if erased:
@@ -655,10 +664,30 @@ def _substitute(typx, subst: tp.Mapping, /):
     return typx
 
 
+def _substitute_signature(sig: inspect.Signature, subst: tp.Mapping, /):
+    return sig.replace(
+        parameters=[
+            p.replace(annotation=_substitute(p.annotation, subst))
+            for p in sig.parameters.values()
+        ],
+        return_annotation=_substitute(sig.return_annotation, subst),
+    )
+
+
+def _free_params(typx, /) -> tuple[_TypeParameter, ...]:
+    if isinstance(typx, _TypeParameter):
+        return (typx,)
+    if tp.get_origin(typx):
+        return getattr(typx, "__parameters__", ())
+    return ()
+
+
 def _specialize(src, dst: type, /, *, erased: bool):
     """Return the base of src whose origin is dst, with the type arguments of
     src substituted, or None if no generic base of src leads to dst.
     """
+    # issubclass raises for a protocol that is not runtime-checkable
+    is_protocol = _is_protocol(dst)
     stack: list[tuple[tp.Any, tp.Mapping]] = [(src, {})]
     while stack:
         typx, subst = stack.pop()
@@ -666,7 +695,7 @@ def _specialize(src, dst: type, /, *, erased: bool):
         if origin is dst:
             return _substitute(typx, subst)
         # a base that is not a subclass of dst cannot lead to it
-        if not (isinstance(origin, type) and issubclass(origin, dst)):
+        if not (isinstance(origin, type) and (is_protocol or issubclass(origin, dst))):
             continue
         params, bases = _generic_bases(origin)
         if (args := _type_args(typx, params, erased=erased)) is None:
@@ -683,6 +712,52 @@ def _map_args(src, dst: type, /, *, erased: bool) -> dict[tp.TypeVar, tp.Any] | 
     if (base := _specialize(src, dst, erased=erased)) is not None:
         params, _ = _generic_bases(dst)
         return _type_args(base, params, erased=erased)
+
+
+def _erase(typx: type, /):
+    """Return typx with the type arguments of a value of it at runtime."""
+    params, _ = _generic_bases(typx)
+    return types.GenericAlias(typx, (tp.Any,) * len(params)) if params else typx
+
+
+def _member_signatures(
+    typx: type, name: str, /
+) -> tuple[type, tuple[inspect.Signature, ...]] | None:
+    """Return the class in the MRO of typx that declares the method name, with
+    the signatures of its overloads bound to an instance, or None if no class
+    declares it.
+    """
+    for owner in typx.__mro__:
+        if (members := _stub_overloads().get(owner)) is not None:
+            if name in members:
+                return owner, _get_signatures(*members[name], is_bound=True)
+            continue
+        attr = vars(owner).get(name)
+        if isinstance(func := getattr(attr, "__func__", attr), types.FunctionType):
+            ovs = tp.get_overloads(func) or (func,)
+            is_bound = not isinstance(attr, staticmethod)
+            return owner, _get_signatures(*ovs, is_bound=is_bound)
+
+
+def _protocol_members(typx: type, /) -> set[str]:
+    """Return the names of the methods that the protocol typx declares."""
+    names = set()
+    for base in typx.__mro__:
+        if not _is_protocol(base):
+            continue
+        if (members := _stub_overloads().get(base)) is not None:
+            names |= members.keys()
+        else:
+            # __protocol_attrs__ leaves out the methods typing adds
+            names |= {
+                name
+                for name in base.__protocol_attrs__
+                if isinstance(
+                    getattr(attr := vars(base).get(name), "__func__", attr),
+                    types.FunctionType,
+                )
+            }
+    return names
 
 
 def _assign_type(dst: subtype, src, /, **ctx: tp.Unpack[_AssignContext]) -> bool:
@@ -712,6 +787,8 @@ def _assign_type(dst: subtype, src, /, **ctx: tp.Unpack[_AssignContext]) -> bool
             return _assign_type(dst, _evaluate(src), **ctx)
         case tp.NewType():
             return _assign_type(dst, src.__supertype__, **ctx)
+        case tp.LiteralString:
+            return _assign_type(dst, builtins.str, **ctx)
         case tp.Self:
             return _assign_type(dst, ctx.get("self_class", object), **ctx)
         case tp.TypeVar():
@@ -899,43 +976,6 @@ class _nominal_subclasscheck(_nominal_instancecheck):
         return issubclass(tp.get_origin(obj) or obj, self.__args__)
 
 
-def _assign_generic(
-    dst: _SupportsGeneric, src, /, *, erased=False, **ctx: tp.Unpack[_AssignContext]
-):
-    if not issubclass(tp.get_origin(src) or src, dst.__origin__):
-        return False
-    src_args = _map_args(src, dst.__origin__, erased=erased)
-    dst_args = _map_args(dst, dst.__origin__, erased=False)
-    if src_args is None or dst_args is None:
-        return True
-    return all(
-        _assign_with_variance(
-            dst_arg,
-            src_args[p],
-            _variance(dst.__origin__, p, assumed_variance=ctx.get("assumed_variance")),
-            **ctx,
-        )
-        for p, dst_arg in dst_args.items()
-    )
-
-
-class _generic_instancecheck(_checker):
-    def __init__(self, typx: _SupportsGeneric, /):
-        self.__form__ = typx
-
-    def __call__(self, obj, /, **ctx):
-        if (src := getattr(obj, "__dict__", {}).get("__orig_class__")) is not None:
-            return _assign_generic(self.__form__, src, **ctx)
-        return _assign_generic(self.__form__, type(obj), erased=True, **ctx)
-
-
-class _generic_subclasscheck(_generic_instancecheck):
-    def __call__(self, obj, /, **ctx):
-        if tp.get_origin(obj) is tp.Literal:
-            return all(map(ft.partial(super().__call__, **ctx), tp.get_args(obj)))
-        return _assign_generic(self.__form__, obj, **ctx)
-
-
 def _assign_tuple(dst, src, /, **ctx: tp.Unpack[_AssignContext]) -> bool:
     origin = tp.get_origin(src) or src
     if not (isinstance(origin, type) and issubclass(origin, builtins.tuple)):
@@ -1073,6 +1113,279 @@ class _callable_subclasscheck(_callable_instancecheck):
         else:
             return False
         return any(_assign_signature(self.signature, sig, **ctx) for sig in sigs)
+
+
+def _member_pairs(
+    dst, src, /, *, erased=False
+) -> list[tuple[list[inspect.Signature], list[inspect.Signature]]] | None:
+    """Pair the signatures of each method of the protocol dst with those of the
+    same method of src, with the type arguments of both substituted, or return
+    None if src does not declare one of them.
+    """
+    origin = tp.get_origin(src) or src
+    pairs = []
+    for name in _protocol_members(tp.get_origin(dst)):
+        dst_member = _member_signatures(tp.get_origin(dst), name)
+        if not isinstance(origin, type) or dst_member is None:
+            return
+        if (src_member := _member_signatures(origin, name)) is None:
+            return
+        dst_sigs, src_sigs = (
+            [
+                _substitute_signature(s, _map_args(x, owner, erased=e) or {})
+                for s in sigs
+            ]
+            for x, (owner, sigs), e in (
+                (dst, dst_member, False),
+                (src, src_member, erased),
+            )
+        )
+        pairs.append((dst_sigs, src_sigs))
+    return pairs
+
+
+def _is_subclass(src, dst: type, /) -> bool:
+    try:
+        return issubclass(tp.get_origin(src) or src, dst)
+    except TypeError:
+        # dst is a protocol that is not runtime-checkable
+        return False
+
+
+def _assign_protocol(
+    dst: _SupportsGeneric,
+    src,
+    pairs: list[tuple[list[inspect.Signature], list[inspect.Signature]]],
+    /,
+    *,
+    erased=False,
+    **ctx: tp.Unpack[_AssignContext],
+) -> bool:
+    if "assuming" not in ctx:
+        ctx["assuming"] = frozenset()
+    # a recursive member reaches the same pair again, which then holds
+    if (subtype(dst), src) in ctx["assuming"]:
+        return True
+    ctx["assuming"] |= {(subtype(dst), src)}
+    # Self in the members of dst and src is src
+    ctx["self_class"] = _erase(src) if erased else src
+    return all(
+        any(_assign_signature(d, s, **ctx) for s in src_sigs)
+        for dst_sigs, src_sigs in pairs
+        for d in dst_sigs
+    )
+
+
+def _assign_generic(
+    dst: _SupportsGeneric, src, /, *, erased=False, **ctx: tp.Unpack[_AssignContext]
+):
+    src_args = _map_args(src, dst.__origin__, erased=erased)
+    if (
+        src_args is None
+        and _is_protocol(dst.__origin__)
+        and (pairs := _member_pairs(dst, src, erased=erased)) is not None
+    ):
+        return _assign_protocol(dst, src, pairs, erased=erased, **ctx)
+    if not _is_subclass(src, dst.__origin__):
+        return False
+    dst_args = _map_args(dst, dst.__origin__, erased=False)
+    if src_args is None or dst_args is None:
+        return True
+    return all(
+        _assign_with_variance(
+            dst_arg,
+            src_args[p],
+            _variance(dst.__origin__, p, assumed_variance=ctx.get("assumed_variance")),
+            **ctx,
+        )
+        for p, dst_arg in dst_args.items()
+    )
+
+
+def _solve_signature(
+    dst: inspect.Signature,
+    src: tp.Iterable[inspect.Signature],
+    solution: dict[_TypeParameter, tp.Any],
+    /,
+    *,
+    self_class: tp.Any = object,
+    assuming: frozenset = frozenset(),
+) -> bool:
+    """Bind the type parameters in the return type of dst to the return type of
+    the first signature in src whose parameters accept those of dst.
+    """
+    # the parameters of dst select the signature but bind nothing
+    unbound = {
+        p: tp.Any for q in dst.parameters.values() for p in _free_params(q.annotation)
+    }
+    selector = _substitute_signature(dst, unbound).replace(return_annotation=tp.Any)
+    for sig in src:
+        if _assign_signature(selector, sig, self_class=self_class):
+            ret = sig.return_annotation
+            if ret is inspect.Signature.empty:
+                ret = tp.Any
+            elif ret is tp.Self:
+                ret = self_class
+            return _solve(dst.return_annotation, ret, solution, assuming=assuming)
+    return False
+
+
+def _solve(
+    dst,
+    src,
+    solution: dict[_TypeParameter, tp.Any],
+    /,
+    *,
+    erased=False,
+    assuming: frozenset = frozenset(),
+) -> bool:
+    """Bind the type parameters in dst to the types src passes to them, and
+    return whether src is assignable to dst.
+    """
+    if isinstance(dst, tp.TypeVar):
+        solution[dst] = tp.Union[solution[dst], src] if dst in solution else src
+        return True
+    if not (params := _free_params(dst)):
+        return _assign_type(subtype(dst), src, self_class=src)
+    if src is tp.Any:
+        for p in params:
+            solution.setdefault(p, tp.Any)
+        return True
+    origin = tp.get_origin(dst)
+    if origin is tp.Union:
+        fixed = [a for a in dst.__args__ if not _free_params(a)]
+        # the members of src that no fixed member of dst accepts bind the rest
+        rest = [
+            s
+            for s in (src.__args__ if tp.get_origin(src) is tp.Union else (src,))
+            if not any(_assign_type(subtype(f), s) for f in fixed)
+        ]
+        return not rest or all(
+            _solve(a, tp.Union[*rest], solution, assuming=assuming)
+            for a in dst.__args__
+            if _free_params(a)
+        )
+    if tp.get_origin(src) is tp.Union:
+        return all(_solve(dst, s, solution, assuming=assuming) for s in src.__args__)
+    if not isinstance(origin, type):
+        return False
+    # a recursive member reaches the same pair again, which then holds
+    if (dst, src) in assuming:
+        return True
+    assuming |= {(dst, src)}
+    if (base := _specialize(src, origin, erased=erased)) is not None:
+        params, _ = _generic_bases(origin)
+        src_args = _type_args(base, params, erased=erased)
+        dst_args = _type_args(dst, params, erased=False)
+        if src_args is None or dst_args is None:
+            return True
+        return all(
+            _solve(a, src_args[p], solution, assuming=assuming)
+            for p, a in dst_args.items()
+        )
+    if not _is_protocol(origin):
+        return False
+    if (pairs := _member_pairs(dst, src, erased=erased)) is None:
+        return _is_subclass(src, origin)
+    self_class = _erase(src) if erased else src
+    return all(
+        _solve_signature(
+            d, src_sigs, solution, self_class=self_class, assuming=assuming
+        )
+        for dst_sigs, src_sigs in pairs
+        for d in dst_sigs
+    )
+
+
+def _solve_value(dst, obj, solution: dict[_TypeParameter, tp.Any], /) -> bool:
+    """Bind the type parameters in dst to the types obj passes to them, and
+    return whether obj is an instance of dst.
+    """
+    if not _free_params(dst):
+        return isinstance(obj, subtype(dst))
+    if (tp.get_origin(dst) or dst) is collections.abc.Callable:
+        if not callable(obj):
+            return False
+        try:
+            sigs = _get_overloads(obj)
+        except ValueError:
+            # obj has no signature to bind from
+            return True
+        # Self in the signature of obj is the class obj binds to
+        owner = getattr(obj, "__self__", obj)
+        return _solve_signature(
+            _callable_signature(dst),
+            sigs,
+            solution,
+            self_class=owner if isinstance(owner, type) else type(owner),
+        )
+    if (src := _infer_type(obj)) is not None:
+        return _solve(dst, src, solution)
+    return _solve(dst, type(obj), solution, erased=True)
+
+
+def _infer_type(obj, /):
+    """Return the type of obj with the type arguments it was created with, or
+    None if they are unknown.
+    """
+    if (src := getattr(obj, "__dict__", {}).get("__orig_class__")) is not None:
+        return src
+    try:
+        reduced = obj.__reduce__()
+    except TypeError:
+        return
+    # obj is equivalent to the result of calling func with args
+    match reduced:
+        case (func, tuple(args), *_) if callable(func):
+            pass
+        case _:
+            return
+    try:
+        sigs = _get_overloads(func)
+    except ValueError:
+        # func has no signature to infer from
+        return
+    for sig in sigs:
+        try:
+            bound = sig.bind(*args)
+        except TypeError:
+            continue
+        solution = {}
+        params = ((sig.parameters[k], v) for k, v in bound.arguments.items())
+        if not all(
+            _solve_value(p.annotation, v, solution)
+            for p, value in params
+            if p.annotation is not p.empty
+            for v in (value if p.kind is p.VAR_POSITIONAL else (value,))
+        ):
+            continue
+        ret = sig.return_annotation
+        # an undeclared return type says nothing about obj
+        if ret is sig.empty:
+            return
+        if ret is tp.Self:
+            if not isinstance(func, type):
+                return
+            type_params, _ = _generic_bases(func)
+            ret = types.GenericAlias(func, type_params) if type_params else func
+        return _substitute(ret, {p: solution.get(p, tp.Any) for p in _free_params(ret)})
+
+
+class _generic_instancecheck(_checker):
+    def __init__(self, typx: _SupportsGeneric, /):
+        self.__form__ = typx
+
+    def __call__(self, obj, /, **ctx):
+        if (src := _infer_type(obj)) is not None:
+            return _assign_generic(self.__form__, src, **ctx)
+        return _assign_generic(self.__form__, type(obj), erased=True, **ctx)
+
+
+class _generic_subclasscheck(_generic_instancecheck):
+    def __call__(self, obj, /, **ctx):
+        if tp.get_origin(obj) is tp.Literal:
+            return all(map(ft.partial(super().__call__, **ctx), tp.get_args(obj)))
+        return _assign_generic(self.__form__, obj, **ctx)
 
 
 class _type_instancecheck(_checker):
