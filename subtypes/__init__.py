@@ -13,7 +13,6 @@ import weakref
 
 _RECURSION_LIMIT = 16
 _TypeParameter: tp.TypeAlias = tp.TypeVar | tp.TypeVarTuple | tp.ParamSpec
-# the signatures of each protocol member in dst, paired with those in src
 _MemberPairs: tp.TypeAlias = tuple[
     tuple[tuple[inspect.Signature, ...], tuple[inspect.Signature, ...]], ...
 ]
@@ -239,15 +238,17 @@ class _SupportsGeneric[T = type[tp.Any]](tp.Protocol):
     __args__: tuple[object, ...]
 
 
-class _Variance(enum.Enum):
+class _AssignFlag(enum.IntFlag):
+    DEFAULT = 0
+    # src must also accept dst
     INVARIANT = enum.auto()
-    COVARIANT = enum.auto()
+    # dst and src are swapped
     CONTRAVARIANT = enum.auto()
 
 
 class _AssignContext(tp.TypedDict, total=False):
     assuming: frozenset[tuple[subtype, tp.Any]]
-    assumed_variance: tp.Mapping[type, _Variance]
+    assumed_variance: tp.Mapping[type, _AssignFlag]
     self_class: tp.Any
 
 
@@ -819,18 +820,18 @@ def _assign_type(dst: subtype, src, /, **ctx: tp.Unpack[_AssignContext]) -> bool
 
 
 def _assign_with_variance(
-    dst, src, variance: _Variance, /, **ctx: tp.Unpack[_AssignContext]
+    dst, src, flags: int = _AssignFlag.DEFAULT, /, **ctx: tp.Unpack[_AssignContext]
 ) -> bool:
     if dst == src:
         return True
-    if variance is not _Variance.CONTRAVARIANT and not _assign_type(
-        subtype(dst), src, **ctx
-    ):
-        return False
-    return variance is _Variance.COVARIANT or _assign_type(subtype(src), dst, **ctx)
+    if flags & _AssignFlag.CONTRAVARIANT:
+        dst, src = src, dst
+    return _assign_type(subtype(dst), src, **ctx) and (
+        not flags & _AssignFlag.INVARIANT or _assign_type(subtype(src), dst, **ctx)
+    )
 
 
-def _declared_types(typx: type, /) -> list[tuple[tp.Any, _Variance]]:
+def _declared_types(typx: type, /) -> list[tuple[tp.Any, _AssignFlag]]:
     """Return the types declared in the members and generic bases of typx,
     each with the variance its assignment requires.
     """
@@ -845,10 +846,10 @@ def _declared_types(typx: type, /) -> list[tuple[tp.Any, _Variance]]:
             [form] = tp.get_args(form)
         dunder = name.startswith("__") and name.endswith("__")
         if final or (name.startswith("_") and not dunder):
-            out.append((form, _Variance.COVARIANT))
+            out.append((form, _AssignFlag.DEFAULT))
         else:
             # a frozen dataclass or NamedTuple field is replaceable by __replace__
-            out.append((form, _Variance.INVARIANT))
+            out.append((form, _AssignFlag.INVARIANT))
     for name, attr in vars(typx).items():
         if name in ("__new__", "__init__"):
             continue
@@ -864,13 +865,13 @@ def _declared_types(typx: type, /) -> list[tuple[tp.Any, _Variance]]:
             ovs = tp.get_overloads(func) or (func,)
             for sig in _get_signatures(*ovs, is_bound=is_bound):
                 out += [
-                    (p.annotation, _Variance.CONTRAVARIANT)
+                    (p.annotation, _AssignFlag.CONTRAVARIANT)
                     for p in sig.parameters.values()
                 ]
-                out.append((sig.return_annotation, _Variance.COVARIANT))
+                out.append((sig.return_annotation, _AssignFlag.DEFAULT))
     _, bases = _generic_bases(typx)
     out += [
-        (base, _Variance.COVARIANT)
+        (base, _AssignFlag.DEFAULT)
         for base in bases
         if tp.get_origin(base) not in (tp.Generic, tp.Protocol, builtins.tuple)
     ]
@@ -884,9 +885,9 @@ def _assign_class_to_self(
     dst_subst, src_subst = (dict(zip(params, x.__args__)) for x in (dst, src))
     return all(
         _assign_with_variance(
-            _substitute(form, dst_subst), _substitute(form, src_subst), variance, **ctx
+            _substitute(form, dst_subst), _substitute(form, src_subst), flags, **ctx
         )
-        for form, variance in _declared_types(dst.__origin__)
+        for form, flags in _declared_types(dst.__origin__)
     )
 
 
@@ -895,10 +896,9 @@ class _VarianceDummy:
 
 
 def _infer_variance(
-    typx, /, *, assumed_variance: tp.Mapping[type, _Variance] | None = None
-) -> dict[tp.TypeVar, _Variance]:
-    if assumed_variance is None:
-        assumed_variance = {}
+    typx, /, **ctx: tp.Unpack[_AssignContext]
+) -> dict[tp.TypeVar, _AssignFlag]:
+    assumed_variance = ctx.setdefault("assumed_variance", {})
     params, _ = _generic_bases(typx)
     out = {}
     for i, param in enumerate(params):
@@ -913,43 +913,36 @@ def _infer_variance(
         if _assign_class_to_self(
             upper,
             lower,
-            assumed_variance={**assumed_variance, typx: _Variance.COVARIANT},
+            assumed_variance={**assumed_variance, typx: _AssignFlag.DEFAULT},
             self_class=typx,
         ):
-            out[param] = _Variance.COVARIANT
+            out[param] = _AssignFlag.DEFAULT
         elif _assign_class_to_self(
             lower,
             upper,
-            assumed_variance={**assumed_variance, typx: _Variance.CONTRAVARIANT},
+            assumed_variance={**assumed_variance, typx: _AssignFlag.CONTRAVARIANT},
             self_class=typx,
         ):
-            out[param] = _Variance.CONTRAVARIANT
+            out[param] = _AssignFlag.CONTRAVARIANT
         else:
-            out[param] = _Variance.INVARIANT
+            out[param] = _AssignFlag.INVARIANT
     return out
 
 
 def _variance(
-    typx: type,
-    param: tp.TypeVar,
-    /,
-    *,
-    assumed_variance: tp.Mapping[type, _Variance] | None = None,
-) -> _Variance:
-    if assumed_variance is None:
-        assumed_variance = {}
+    typx: type, param: tp.TypeVar, /, **ctx: tp.Unpack[_AssignContext]
+) -> _AssignFlag:
+    assumed_variance = ctx.setdefault("assumed_variance", {})
     if (assumed := assumed_variance.get(typx)) is not None:
         return assumed
     if param.__covariant__:
-        return _Variance.COVARIANT
+        return _AssignFlag.DEFAULT
     if param.__contravariant__:
-        return _Variance.CONTRAVARIANT
+        return _AssignFlag.CONTRAVARIANT
     if not param.__infer_variance__:
-        return _Variance.INVARIANT
+        return _AssignFlag.INVARIANT
     if (variances := _inferred_variance.get(typx)) is None:
-        variances = _inferred_variance[typx] = _infer_variance(
-            typx, assumed_variance=assumed_variance
-        )
+        variances = _inferred_variance[typx] = _infer_variance(typx, **ctx)
     return variances[param]
 
 
@@ -998,7 +991,7 @@ def _assign_tuple(dst, src, /, **ctx: tp.Unpack[_AssignContext]) -> bool:
     if not _adjust_tuple_entries(dst_entries, src_entries):
         return False
     return all(
-        _assign_with_variance(d, s, _Variance.COVARIANT, **ctx)
+        _assign_with_variance(d, s, **ctx)
         for (d, _), (s, _) in zip(dst_entries, src_entries)
     )
 
@@ -1012,10 +1005,11 @@ class _tuple_instancecheck(_checker):
             return False
         if (entries := _tuple_entries(self.__form__)) is None:
             return True
-        ts = [t for t, _ in entries]
-        i = next(
-            (i for i, (_, indeterminate) in enumerate(entries) if indeterminate), None
-        )
+        [*items] = zip(*entries)
+        if not items:
+            return not obj
+        [[*ts], det] = items
+        i = next((i for i, indeterminate in enumerate(det) if indeterminate), None)
         if i is not None:
             ts[i : i + 1] *= len(obj) - len(entries) + 1
         return len(ts) == len(obj) and all(
@@ -1059,10 +1053,7 @@ def _assign_signature(
         return tp.Any if typx is inspect.Parameter.empty else typx
 
     if not _assign_with_variance(
-        dst.return_annotation,
-        annotation(src.return_annotation),
-        _Variance.COVARIANT,
-        **ctx,
+        dst.return_annotation, annotation(src.return_annotation), **ctx
     ):
         return False
     src_params = [*src.parameters.values()]
@@ -1079,7 +1070,7 @@ def _assign_signature(
         if not _assign_with_variance(
             dst_param.annotation,
             annotation(src_param.annotation),
-            _Variance.CONTRAVARIANT,
+            _AssignFlag.CONTRAVARIANT,
             **ctx,
         ):
             return False
@@ -1200,10 +1191,7 @@ def _assign_generic(
         return True
     return all(
         _assign_with_variance(
-            dst_arg,
-            src_args[p],
-            _variance(dst.__origin__, p, assumed_variance=ctx.get("assumed_variance")),
-            **ctx,
+            dst_arg, src_args[p], _variance(dst.__origin__, p, **ctx), **ctx
         )
         for p, dst_arg in dst_args.items()
     )
