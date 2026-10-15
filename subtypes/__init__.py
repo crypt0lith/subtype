@@ -1261,17 +1261,29 @@ def _solve(
     origin = tp.get_origin(dst)
     if origin is tp.Union:
         fixed = [a for a in dst.__args__ if not _free_params(a)]
-        # the members of src that no fixed member of dst accepts bind the rest
-        rest = [
-            s
-            for s in (src.__args__ if tp.get_origin(src) is tp.Union else (src,))
-            if not any(_assign_type(subtype(f), s) for f in fixed)
-        ]
-        return not rest or all(
-            _solve(a, tp.Union[*rest], solution, assuming=assuming)
-            for a in dst.__args__
-            if _free_params(a)
+        # a bare TypeVar accepts any member of src, so it is tried last
+        free = sorted(
+            (a for a in dst.__args__ if _free_params(a)),
+            key=lambda a: isinstance(a, tp.TypeVar),
         )
+        for s in src.__args__ if tp.get_origin(src) is tp.Union else (src,):
+            if any(_assign_type(subtype(f), s) for f in fixed):
+                continue
+            # a member of dst selects s by its erasure, which binds nothing
+            member = next(
+                (
+                    a
+                    for a in free
+                    if _assign_type(
+                        subtype(_substitute(a, dict.fromkeys(_free_params(a), tp.Any))),
+                        s,
+                    )
+                ),
+                None,
+            )
+            if member is None or not _solve(member, s, solution, assuming=assuming):
+                return False
+        return True
     if tp.get_origin(src) is tp.Union:
         return all(_solve(dst, s, solution, assuming=assuming) for s in src.__args__)
     if not isinstance(origin, type):

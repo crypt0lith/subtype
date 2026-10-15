@@ -28,6 +28,34 @@ class Seq:
     def __getitem__(self, i: int, /) -> str: ...
 
 
+class Box[T]: ...
+
+
+class Pair[T1, T2]: ...
+
+
+class Reduces:
+    def __new__(cls, x, /):
+        self = super().__new__(cls)
+        self.x = x
+        return self
+
+    def __reduce__(self):
+        return type(self), (self.x,)
+
+
+class Either[T](Reduces):
+    def __init__(self, x: Box[T] | set[T], /) -> None: ...
+
+
+class Swap[T](Reduces):
+    def __init__(self, x: Pair[T, str] | Pair[str, T], /) -> None: ...
+
+
+class Wrapped[T](Reduces):
+    def __init__(self, x: T | Box[T], /) -> None: ...
+
+
 @pytest.mark.parametrize(
     "src, dst, expected",
     [
@@ -85,6 +113,12 @@ def test_instancecheck(obj, dst, expected):
         (filter(None, iter(range(2))), tp.Iterable[str], False),
         (enumerate("ab"), tp.Iterable[tuple[int, str]], True),
         (enumerate("ab"), tp.Iterable[tuple[str, str]], False),
+        (Either(Box[int]()), Either[int], True),
+        (Either(Box[int]()), Either[str], False),
+        (Swap(Pair[str, int]()), Swap[int], True),
+        (Swap(Pair[str, int]()), Swap[str], False),
+        (Wrapped(Box[int]()), Wrapped[int], True),
+        (Wrapped(Box[int]()), Wrapped[Box[int]], False),
         # the reduce callable of this has no signature
         (collections.deque([1]), tp.Iterable[int], True),
     ],
