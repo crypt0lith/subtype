@@ -591,17 +591,6 @@ def _get_overloads(obj: tp.Callable, /) -> tuple[inspect.Signature, ...]:
     return sigs
 
 
-def _default_arg(param: tp.TypeVar, /, *, erased: bool):
-    # a value's type arguments are erased at runtime
-    if erased:
-        return tp.Any
-    if param.has_default():
-        return param.__default__
-    if param.__constraints__:
-        return tp.Union[param.__constraints__]
-    return object if param.__bound__ is None else param.__bound__
-
-
 def _generic_bases(typx: type, /) -> tuple[tuple[_TypeParameter, ...], tuple]:
     """Return the type parameters and generic bases of typx."""
     if (bases := vars(typx).get("__orig_bases__")) is None:
@@ -623,6 +612,17 @@ def _generic_bases(typx: type, /) -> tuple[tuple[_TypeParameter, ...], tuple]:
         p for b in bases if tp.get_origin(b) for p in getattr(b, "__parameters__", ())
     )
     return tuple(dict.fromkeys(params)), bases
+
+
+def _default_arg(param: tp.TypeVar, /, *, erased: bool):
+    # a value's type arguments are erased at runtime
+    if erased:
+        return tp.Any
+    if param.has_default():
+        return param.__default__
+    if param.__constraints__:
+        return tp.Union[param.__constraints__]
+    return object if param.__bound__ is None else param.__bound__
 
 
 def _type_args(
