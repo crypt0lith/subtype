@@ -186,37 +186,6 @@ class _checker(abc.ABC):
     def __call__(self, obj: tp.Any, /, **ctx: tp.Unpack[_AssignContext]) -> bool: ...
 
 
-class _literal_instancecheck(_checker):
-    def __call__(self, obj, /, **ctx):
-        # Literal[1] excludes True
-        return any(type(obj) is type(a) and obj == a for a in self.__args__)
-
-
-class _literal_subclasscheck(_literal_instancecheck):
-    def __call__(self, obj, /, **ctx):
-        return tp.get_origin(obj) is tp.Literal and all(
-            map(ft.partial(super().__call__, **ctx), tp.get_args(obj))
-        )
-
-
-_PROMOTIONS = {float: (float, int), complex: (complex, float, int)}
-
-
-class _nominal_instancecheck(_checker):
-    def __init__(self, typx: type, /):
-        self.__args__ = _PROMOTIONS.get(typx, (typx,))
-
-    def __call__(self, obj, /, **ctx):
-        return isinstance(obj, self.__args__)
-
-
-class _nominal_subclasscheck(_nominal_instancecheck):
-    def __call__(self, obj, /, **ctx):
-        if tp.get_origin(obj) is tp.Literal:
-            return all(map(ft.partial(super().__call__, **ctx), tp.get_args(obj)))
-        return issubclass(tp.get_origin(obj) or obj, self.__args__)
-
-
 class _ForwardRefSubscriptTransformer(ast.NodeTransformer):
     def __init__(
         self,
@@ -884,6 +853,37 @@ def _variance(
             typx, assumed_variance=assumed_variance
         )
     return variances[param]
+
+
+class _literal_instancecheck(_checker):
+    def __call__(self, obj, /, **ctx):
+        # Literal[1] excludes True
+        return any(type(obj) is type(a) and obj == a for a in self.__args__)
+
+
+class _literal_subclasscheck(_literal_instancecheck):
+    def __call__(self, obj, /, **ctx):
+        return tp.get_origin(obj) is tp.Literal and all(
+            map(ft.partial(super().__call__, **ctx), tp.get_args(obj))
+        )
+
+
+_PROMOTIONS = {float: (float, int), complex: (complex, float, int)}
+
+
+class _nominal_instancecheck(_checker):
+    def __init__(self, typx: type, /):
+        self.__args__ = _PROMOTIONS.get(typx, (typx,))
+
+    def __call__(self, obj, /, **ctx):
+        return isinstance(obj, self.__args__)
+
+
+class _nominal_subclasscheck(_nominal_instancecheck):
+    def __call__(self, obj, /, **ctx):
+        if tp.get_origin(obj) is tp.Literal:
+            return all(map(ft.partial(super().__call__, **ctx), tp.get_args(obj)))
+        return issubclass(tp.get_origin(obj) or obj, self.__args__)
 
 
 def _assign_generic(
