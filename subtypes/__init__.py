@@ -646,6 +646,14 @@ def _type_args(
     return subst
 
 
+def _substitute(typx, subst: tp.Mapping, /):
+    if isinstance(typx, tp.TypeVar):
+        return subst.get(typx, typx)
+    if tp.get_origin(typx) and (params := getattr(typx, "__parameters__", ())):
+        return typx[*(subst.get(p, p) for p in params)]
+    return typx
+
+
 def _specialize(src, dst: type, /, *, erased: bool):
     """Return the base of src whose origin is dst, with the type arguments of
     src substituted, or None if no generic base of src leads to dst.
@@ -702,14 +710,6 @@ def _adjust_tuple_entries(
         packed = [t for t, _ in src[dst_i : dst_i + n]]
         src[dst_i : dst_i + n] = [(tp.Union[*packed] if packed else tp.Any, False)]
     return len(dst) == len(src)
-
-
-def _substitute(typx, subst: tp.Mapping, /):
-    if isinstance(typx, tp.TypeVar):
-        return subst.get(typx, typx)
-    if tp.get_origin(typx) and (params := getattr(typx, "__parameters__", ())):
-        return typx[*(subst.get(p, p) for p in params)]
-    return typx
 
 
 def _assign_type(dst: subtype, src, /, **ctx: tp.Unpack[_AssignContext]) -> bool:
