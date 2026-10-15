@@ -161,31 +161,6 @@ def _make_typevars_bound(
     return typx
 
 
-class _SupportsGeneric[T = type[tp.Any]](tp.Protocol):
-    __origin__: T
-    __args__: tuple[object, ...]
-
-
-class _Variance(enum.Enum):
-    INVARIANT = enum.auto()
-    COVARIANT = enum.auto()
-    CONTRAVARIANT = enum.auto()
-
-
-class _AssignContext(tp.TypedDict):
-    assuming: frozenset[tuple[subtype, tp.Any]]
-    assumed_variance: tp.Mapping[type, _Variance]
-    self_class: tp.Any
-
-
-class _checker(abc.ABC):
-    def __init__(self, typx: _SupportsGeneric, /):
-        self.__args__ = typx.__args__
-
-    @abc.abstractmethod
-    def __call__(self, obj: tp.Any, /, **ctx: tp.Unpack[_AssignContext]) -> bool: ...
-
-
 class _ForwardRefSubscriptTransformer(ast.NodeTransformer):
     def __init__(
         self,
@@ -249,6 +224,31 @@ def _evaluate(typx: tp.TypeAliasType | tp.ForwardRef, /):
     if tp.get_args(typx):
         return _make_typevars_bound(typx)
     return typx.__value__
+
+
+class _SupportsGeneric[T = type[tp.Any]](tp.Protocol):
+    __origin__: T
+    __args__: tuple[object, ...]
+
+
+class _Variance(enum.Enum):
+    INVARIANT = enum.auto()
+    COVARIANT = enum.auto()
+    CONTRAVARIANT = enum.auto()
+
+
+class _AssignContext(tp.TypedDict):
+    assuming: frozenset[tuple[subtype, tp.Any]]
+    assumed_variance: tp.Mapping[type, _Variance]
+    self_class: tp.Any
+
+
+class _checker(abc.ABC):
+    def __init__(self, typx: _SupportsGeneric, /):
+        self.__args__ = typx.__args__
+
+    @abc.abstractmethod
+    def __call__(self, obj: tp.Any, /, **ctx: tp.Unpack[_AssignContext]) -> bool: ...
 
 
 @ft.cache
