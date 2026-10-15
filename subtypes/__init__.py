@@ -1454,8 +1454,13 @@ class subtype(type):
     __subtype_subclasscheck__: _checker
 
     def __new__(mcls, typx, /):
+        if isinstance(typx, mcls):
+            if type(typx) is mcls:
+                return typx
+            typx = typx.__subtype_form__
         if (cls := _subtypes.get(typx)) is not None:
             return cls
+
         i_check = "__subtype_instancecheck__"
         s_check = "__subtype_subclasscheck__"
         namespace = {"__subtype_form__": typx}
@@ -1476,6 +1481,9 @@ class subtype(type):
                 namespace[i_check] = _literal_instancecheck(typx)
                 namespace[s_check] = _literal_subclasscheck(typx)
             case tp.Union:
+                args = tuple(getattr(a, "__subtype_form__", a) for a in typx.__args__)
+                if args != typx.__args__:
+                    return mcls(tp.Union[args])
                 members = tuple(map(mcls, typx.__args__))
                 namespace[i_check] = lambda obj, **ctx: any(
                     m.__subtype_instancecheck__(obj, **ctx) for m in members
@@ -1546,3 +1554,17 @@ class subtype(type):
     @tp.final
     def __call__(cls) -> tp.Never:
         raise TypeError(f"cannot instantiate {type(cls).__qualname__} objects")
+
+    def __or__[T: subtype](cls: T, other, /) -> T:
+        if isinstance(other, mcls := type(cls)):
+            return mcls(cls.__subtype_form__ | other.__subtype_form__)
+        try:
+            return mcls(cls.__subtype_form__ | other)
+        except NotImplementedError, TypeError:
+            return NotImplemented
+
+    def __ror__[T: subtype](cls: T, other, /) -> T:
+        try:
+            return cls.__class__(other | cls.__subtype_form__)
+        except NotImplementedError, TypeError:
+            return NotImplemented
