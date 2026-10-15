@@ -254,6 +254,343 @@ def _evaluate(typx: tp.TypeAliasType | tp.ForwardRef, /):
     return typx.__value__
 
 
+@ft.cache
+def _builtin_callables():
+    import _collections_abc
+
+    out = {
+        k: v
+        for k, v in map(
+            lambda k, d=(_collections_abc.__dict__ | builtins.__dict__): (k, d[k]),
+            _collections_abc.__dict__.keys() ^ builtins.__dict__.keys(),
+        )
+        if callable(v)
+        if hasattr(builtins, k) or not k.startswith("_")
+    }
+    return types.MappingProxyType(out)
+
+
+@ft.cache
+def _load_stubs():
+    class TypeAliasTransformer(_ForwardRefSubscriptTransformer):
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.stmt:
+            # check if this is a self-referential TypeAlias
+            if (
+                isinstance(node.target, ast.Name)
+                and isinstance(node.annotation, ast.Name)
+                and node.annotation.id == "TypeAlias"
+                and node.value is not None
+                and any(
+                    isinstance(n, ast.Name) and n.id == node.target.id
+                    for n in ast.walk(node.value)
+                )
+            ):
+                # convert to PEP 695 type statement to lazily evaluate
+                # the self-reference.
+                return ast.copy_location(
+                    ast.TypeAlias(
+                        ast.Name(node.target.id, ast.Store()), [], node.value
+                    ),
+                    node,
+                )
+            return node
+
+    class OverloadCollector(TypeAliasTransformer):
+        def __init__(self, module: types.ModuleType, /):
+            super().__init__(globals=_builtin_callables())
+            self._module = module
+            # __builtins__ fallback for the stub definitions _body deletes
+            self._runtime = builtins.__dict__ | {"overload": tp.overload} | vars(module)
+            self.overloads = None
+            self.classes = {}
+
+        def collect(self, node, /):
+            res = ast.fix_missing_locations(self.visit(node))
+            name = self._module.__name__
+            prev = tp._overload_registry
+            try:
+                self.overloads = tp._overload_registry.__class__(
+                    tp._overload_registry.default_factory
+                )
+                tp._overload_registry = self.overloads
+                exec(
+                    compile(res, "<ast>", "exec", dont_inherit=True),
+                    {
+                        "__name__": name,
+                        "__builtins__": self._runtime,
+                        "__stub_class__": self._register,
+                    },
+                )
+            finally:
+                tp._overload_registry = prev
+            return self.overloads[name]
+
+        def _register(self, typx: type, /):
+            self.classes[typx.__name__] = typx
+            return typx
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.ImportFrom:
+            if node.module == "typing":
+                # type_check_only does not exist at runtime
+                node.names = [a for a in node.names if a.name != "type_check_only"]
+            return node
+
+        def _body(self, body: list[ast.stmt], depth: int = 0) -> list[ast.stmt]:
+            out: list[ast.stmt] = []
+            for s in body:
+                if isinstance(s, ast.If):
+                    s.body = self._body(s.body, depth)
+                    s.orelse = self._body(s.orelse, depth) if s.orelse else []
+                    out.append(s)
+                elif isinstance(s, ast.ClassDef):
+                    if s.name in self._runtime:
+                        bases = s.bases
+                        s.bases, s.keywords, s.decorator_list = [], [], []
+                        s.body = self._body(s.body, depth + 1)
+                        if bases and not depth:
+                            # evaluated once the module no longer binds the
+                            # stub definitions
+                            s.body.append(
+                                ast.AnnAssign(
+                                    ast.Name("__orig_bases__", ast.Store()),
+                                    self.visit(ast.Tuple(bases, ast.Load())),
+                                    None,
+                                    simple=1,
+                                )
+                            )
+                            s.decorator_list = [ast.Name("__stub_class__", ast.Load())]
+                        out += [s, ast.Delete([ast.Name(s.name, ast.Del())])]
+                    else:
+                        s.decorator_list = [
+                            d
+                            for d in s.decorator_list
+                            if not (
+                                isinstance(d, ast.Name) and d.id == "type_check_only"
+                            )
+                        ]
+                        out.append(s)
+                elif isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if depth or s.name in self._runtime:
+                        is_prop = False
+                        for d in s.decorator_list:
+                            if isinstance(d, ast.Name) and d.id in {
+                                "property",
+                                "overload",
+                            }:
+                                is_prop = d.id == "property"
+                                break
+                            if (
+                                isinstance(d, ast.Attribute)
+                                and getattr(d.value, "id", None) == s.name
+                            ):
+                                is_prop = True
+                                break
+                        else:
+                            s.decorator_list.append(ast.Name("overload", ast.Load()))
+                        if not is_prop:
+                            self.generic_visit(s)
+                        out.append(s)
+                        if not depth:
+                            out.append(ast.Delete([ast.Name(s.name, ast.Del())]))
+                    else:
+                        out.append(s)
+                elif not depth:
+                    out.append(self.visit(s))
+            return out or [ast.Pass()]
+
+        def visit_Module(self, node: ast.Module) -> ast.Module:
+            node.body = self._body(node.body)
+            return node
+
+    import _collections_abc
+    from importlib.machinery import SourceFileLoader
+    from importlib.resources import as_file, files
+    from importlib.util import module_from_spec, spec_from_loader
+
+    class PyiLoader(SourceFileLoader):
+        def source_to_code(self, data, path, *, _optimize=-1):
+            tree = TypeAliasTransformer().visit(ast.parse(data, path))
+            return compile(
+                ast.fix_missing_locations(tree), path, "exec", dont_inherit=True
+            )
+
+        def path_stats(self, path):
+            st = super().path_stats(path)
+            from os import stat
+
+            return {**st, "mtime": max(st["mtime"], stat(__file__).st_mtime)}
+
+    def runtime_class(module, name):
+        owner = vars(module).get(name)
+        owner = tp.get_origin(owner) or owner
+        return owner if isinstance(owner, type) else None
+
+    STUBS = files(__name__) / "_stubs"
+    out = {}
+    bases = {}
+    with as_file(STUBS / "_typeshed" / "__init__.pyi") as path:
+        spec = spec_from_loader(
+            "_typeshed", PyiLoader("_typeshed", str(path)), is_package=True
+        )
+        assert spec is not None
+        assert spec.loader is not None
+        sys.modules["_typeshed"] = mod = module_from_spec(spec)
+        try:
+            spec.loader.exec_module(mod)
+            for stub, module in (
+                ("builtins.pyi", builtins),
+                ("_collections_abc.pyi", _collections_abc),
+                ("typing.pyi", tp),
+            ):
+                collector = OverloadCollector(module)
+                collected = collector.collect(ast.parse((STUBS / stub).read_bytes()))
+                for qualname, ovs in collected.items():
+                    head, sep, name = qualname.partition(".")
+                    if not sep:
+                        owner, name = module, head
+                    elif (owner := runtime_class(module, head)) is None:
+                        continue
+                    out.setdefault(owner, {})[name] = tuple(ovs.values())
+                for name, typx in collector.classes.items():
+                    if (owner := runtime_class(module, name)) is not None:
+                        bases[owner] = annotationlib.get_annotations(
+                            typx, format=annotationlib.Format.FORWARDREF
+                        )["__orig_bases__"]
+        finally:
+            del sys.modules["_typeshed"]
+    overloads = {owner: types.MappingProxyType(d) for owner, d in out.items()}
+    return types.MappingProxyType(overloads), types.MappingProxyType(bases)
+
+
+def _stub_overloads() -> (
+    types.MappingProxyType[
+        type | types.ModuleType,
+        types.MappingProxyType[str, tuple[types.FunctionType, ...]],
+    ]
+):
+    """Map runtime classes and modules to their stub overloads, by name."""
+    return _load_stubs()[0]
+
+
+def _stub_bases() -> types.MappingProxyType[type, tuple[tp.Any, ...]]:
+    """Map runtime classes to their generic bases in the stubs."""
+    return _load_stubs()[1]
+
+
+@ft.cache
+def _stub_functions() -> (
+    types.MappingProxyType[types.FunctionType, tuple[types.FunctionType, ...]]
+):
+    """Map runtime Python functions to their stub overloads."""
+    out = {}
+    for owner, members in _stub_overloads().items():
+        for name, ovs in members.items():
+            attr = vars(owner).get(name)
+            # unwrap __func__ from a classmethod or staticmethod
+            if isinstance(func := getattr(attr, "__func__", attr), types.FunctionType):
+                out[func] = ovs
+    return types.MappingProxyType(out)
+
+
+def _resolve_call(obj, /) -> tuple[tp.Sequence[tp.Callable], bool]:
+    """Return the overloads that calling obj calls, and whether the call binds
+    their self or cls parameter.
+    """
+
+    def lookup(mro, /, *names: str):
+        for typx in mro:
+            if (members := _stub_overloads().get(typx)) is not None:
+                decls = [members[name] for name in names if name in members]
+            else:
+                attrs = (vars(typx)[name] for name in names if name in vars(typx))
+                decls = [
+                    (
+                        tp.get_overloads(a)
+                        if isinstance(getattr(a, "__func__", a), types.FunctionType)
+                        else ()
+                    )
+                    for a in attrs
+                ]
+            if decls:
+                return max(decls, key=len)
+        return ()
+
+    objtype = type(obj)
+    if isinstance(obj, types.FunctionType) or hasattr(objtype, "__func__"):
+        ovs = tp.get_overloads(obj) or _stub_functions().get(
+            getattr(obj, "__func__", obj), ()
+        )
+        return ovs, hasattr(objtype, "__self__")
+    if hasattr(objtype, "__self__"):
+        # __self__ is None for C static methods, so get the module name
+        # or self type from __reduce__ instead.
+        match obj.__reduce__():
+            case str(name):
+                # sys.modules[obj.__module__][name] => function
+                members = _stub_overloads().get(sys.modules[obj.__module__], {})
+                return members.get(name, ()), False
+            case _, (m_self, name):
+                # getattr(m_self, name) => unbound method
+                if isinstance(m_self, type):
+                    # include the metaclass in attribute lookup
+                    mro = (*m_self.__mro__, *type(m_self).__mro__)
+                else:
+                    mro = type(m_self).__mro__
+                # special case for tp_new: __new__ is a C static method
+                # where __self__ is m_self
+                is_bound = getattr(obj, "__self__", None) is m_self
+                return lookup(mro, name), is_bound and name != "__new__"
+    if hasattr(objtype, "__objclass__"):
+        # unbound C method descriptor
+        return lookup(obj.__objclass__.__mro__, obj.__name__), False
+    call = next(
+        vars(typx)["__call__"] for typx in objtype.__mro__ if "__call__" in vars(typx)
+    )
+    if call is vars(type)["__call__"]:
+        # the constructor type.__call__ delegates to
+        return lookup(obj.__mro__, "__new__", "__init__"), True
+    if hasattr(type(call), "__get__"):
+        call = call.__get__(obj, objtype)
+    return _resolve_call(call)
+
+
+@ft.lru_cache
+def _get_signatures(*funcs: tp.Callable, is_bound=False):
+    sigs = map(
+        ft.partial(
+            inspect.signature, annotation_format=annotationlib.Format.FORWARDREF
+        ),
+        # unwrap __func__ from a classmethod or staticmethod
+        (getattr(func, "__func__", func) for func in funcs),
+    )
+    if is_bound:
+        sigs = (sig.replace(parameters=[*sig.parameters.values()][1:]) for sig in sigs)
+    return tuple(sigs)
+
+
+def _get_overloads(obj: tp.Callable, /) -> tuple[inspect.Signature, ...]:
+    if not callable(obj):
+        raise TypeError
+    ovs, is_bound = _resolve_call(obj)
+    if ovs:
+        sigs = _get_signatures(*ovs, is_bound=is_bound)
+    else:
+        sigs = (
+            inspect.signature(obj, annotation_format=annotationlib.Format.FORWARDREF),
+        )
+    if isinstance(obj, type):
+        # an unannotated or __init__ signature returns an instance of the class
+        return tuple(
+            (
+                sig.replace(return_annotation=tp.Self)
+                if sig.return_annotation in (None, inspect.Signature.empty)
+                else sig
+            )
+            for sig in sigs
+        )
+    return sigs
+
+
 def _default_arg(param: tp.TypeVar, /, *, erased: bool):
     # a value's type arguments are erased at runtime
     if erased:
@@ -854,340 +1191,3 @@ def _assign_type(dst: subtype, src, /, **ctx: tp.Unpack[_AssignContext]) -> bool
                     )
                 return _assign_type(dst, type[arg.__bound__ or object], **ctx)
     return dst.__subtype_subclasscheck__(src, **ctx)
-
-
-@ft.cache
-def _builtin_callables():
-    import _collections_abc
-
-    out = {
-        k: v
-        for k, v in map(
-            lambda k, d=(_collections_abc.__dict__ | builtins.__dict__): (k, d[k]),
-            _collections_abc.__dict__.keys() ^ builtins.__dict__.keys(),
-        )
-        if callable(v)
-        if hasattr(builtins, k) or not k.startswith("_")
-    }
-    return types.MappingProxyType(out)
-
-
-@ft.cache
-def _load_stubs():
-    class TypeAliasTransformer(_ForwardRefSubscriptTransformer):
-        def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.stmt:
-            # check if this is a self-referential TypeAlias
-            if (
-                isinstance(node.target, ast.Name)
-                and isinstance(node.annotation, ast.Name)
-                and node.annotation.id == "TypeAlias"
-                and node.value is not None
-                and any(
-                    isinstance(n, ast.Name) and n.id == node.target.id
-                    for n in ast.walk(node.value)
-                )
-            ):
-                # convert to PEP 695 type statement to lazily evaluate
-                # the self-reference.
-                return ast.copy_location(
-                    ast.TypeAlias(
-                        ast.Name(node.target.id, ast.Store()), [], node.value
-                    ),
-                    node,
-                )
-            return node
-
-    class OverloadCollector(TypeAliasTransformer):
-        def __init__(self, module: types.ModuleType, /):
-            super().__init__(globals=_builtin_callables())
-            self._module = module
-            # __builtins__ fallback for the stub definitions _body deletes
-            self._runtime = builtins.__dict__ | {"overload": tp.overload} | vars(module)
-            self.overloads = None
-            self.classes = {}
-
-        def collect(self, node, /):
-            res = ast.fix_missing_locations(self.visit(node))
-            name = self._module.__name__
-            prev = tp._overload_registry
-            try:
-                self.overloads = tp._overload_registry.__class__(
-                    tp._overload_registry.default_factory
-                )
-                tp._overload_registry = self.overloads
-                exec(
-                    compile(res, "<ast>", "exec", dont_inherit=True),
-                    {
-                        "__name__": name,
-                        "__builtins__": self._runtime,
-                        "__stub_class__": self._register,
-                    },
-                )
-            finally:
-                tp._overload_registry = prev
-            return self.overloads[name]
-
-        def _register(self, typx: type, /):
-            self.classes[typx.__name__] = typx
-            return typx
-
-        def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.ImportFrom:
-            if node.module == "typing":
-                # type_check_only does not exist at runtime
-                node.names = [a for a in node.names if a.name != "type_check_only"]
-            return node
-
-        def _body(self, body: list[ast.stmt], depth: int = 0) -> list[ast.stmt]:
-            out: list[ast.stmt] = []
-            for s in body:
-                if isinstance(s, ast.If):
-                    s.body = self._body(s.body, depth)
-                    s.orelse = self._body(s.orelse, depth) if s.orelse else []
-                    out.append(s)
-                elif isinstance(s, ast.ClassDef):
-                    if s.name in self._runtime:
-                        bases = s.bases
-                        s.bases, s.keywords, s.decorator_list = [], [], []
-                        s.body = self._body(s.body, depth + 1)
-                        if bases and not depth:
-                            # evaluated once the module no longer binds the
-                            # stub definitions
-                            s.body.append(
-                                ast.AnnAssign(
-                                    ast.Name("__orig_bases__", ast.Store()),
-                                    self.visit(ast.Tuple(bases, ast.Load())),
-                                    None,
-                                    simple=1,
-                                )
-                            )
-                            s.decorator_list = [ast.Name("__stub_class__", ast.Load())]
-                        out += [s, ast.Delete([ast.Name(s.name, ast.Del())])]
-                    else:
-                        s.decorator_list = [
-                            d
-                            for d in s.decorator_list
-                            if not (
-                                isinstance(d, ast.Name) and d.id == "type_check_only"
-                            )
-                        ]
-                        out.append(s)
-                elif isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    if depth or s.name in self._runtime:
-                        is_prop = False
-                        for d in s.decorator_list:
-                            if isinstance(d, ast.Name) and d.id in {
-                                "property",
-                                "overload",
-                            }:
-                                is_prop = d.id == "property"
-                                break
-                            if (
-                                isinstance(d, ast.Attribute)
-                                and getattr(d.value, "id", None) == s.name
-                            ):
-                                is_prop = True
-                                break
-                        else:
-                            s.decorator_list.append(ast.Name("overload", ast.Load()))
-                        if not is_prop:
-                            self.generic_visit(s)
-                        out.append(s)
-                        if not depth:
-                            out.append(ast.Delete([ast.Name(s.name, ast.Del())]))
-                    else:
-                        out.append(s)
-                elif not depth:
-                    out.append(self.visit(s))
-            return out or [ast.Pass()]
-
-        def visit_Module(self, node: ast.Module) -> ast.Module:
-            node.body = self._body(node.body)
-            return node
-
-    import _collections_abc
-    from importlib.machinery import SourceFileLoader
-    from importlib.resources import as_file, files
-    from importlib.util import module_from_spec, spec_from_loader
-
-    class PyiLoader(SourceFileLoader):
-        def source_to_code(self, data, path, *, _optimize=-1):
-            tree = TypeAliasTransformer().visit(ast.parse(data, path))
-            return compile(
-                ast.fix_missing_locations(tree), path, "exec", dont_inherit=True
-            )
-
-        def path_stats(self, path):
-            st = super().path_stats(path)
-            from os import stat
-
-            return {**st, "mtime": max(st["mtime"], stat(__file__).st_mtime)}
-
-    def runtime_class(module, name):
-        owner = vars(module).get(name)
-        owner = tp.get_origin(owner) or owner
-        return owner if isinstance(owner, type) else None
-
-    STUBS = files(__name__) / "_stubs"
-    out = {}
-    bases = {}
-    with as_file(STUBS / "_typeshed" / "__init__.pyi") as path:
-        spec = spec_from_loader(
-            "_typeshed", PyiLoader("_typeshed", str(path)), is_package=True
-        )
-        assert spec is not None
-        assert spec.loader is not None
-        sys.modules["_typeshed"] = mod = module_from_spec(spec)
-        try:
-            spec.loader.exec_module(mod)
-            for stub, module in (
-                ("builtins.pyi", builtins),
-                ("_collections_abc.pyi", _collections_abc),
-                ("typing.pyi", tp),
-            ):
-                collector = OverloadCollector(module)
-                collected = collector.collect(ast.parse((STUBS / stub).read_bytes()))
-                for qualname, ovs in collected.items():
-                    head, sep, name = qualname.partition(".")
-                    if not sep:
-                        owner, name = module, head
-                    elif (owner := runtime_class(module, head)) is None:
-                        continue
-                    out.setdefault(owner, {})[name] = tuple(ovs.values())
-                for name, typx in collector.classes.items():
-                    if (owner := runtime_class(module, name)) is not None:
-                        bases[owner] = annotationlib.get_annotations(
-                            typx, format=annotationlib.Format.FORWARDREF
-                        )["__orig_bases__"]
-        finally:
-            del sys.modules["_typeshed"]
-    overloads = {owner: types.MappingProxyType(d) for owner, d in out.items()}
-    return types.MappingProxyType(overloads), types.MappingProxyType(bases)
-
-
-def _stub_overloads() -> (
-    types.MappingProxyType[
-        type | types.ModuleType,
-        types.MappingProxyType[str, tuple[types.FunctionType, ...]],
-    ]
-):
-    """Map runtime classes and modules to their stub overloads, by name."""
-    return _load_stubs()[0]
-
-
-def _stub_bases() -> types.MappingProxyType[type, tuple[tp.Any, ...]]:
-    """Map runtime classes to their generic bases in the stubs."""
-    return _load_stubs()[1]
-
-
-@ft.cache
-def _stub_functions() -> (
-    types.MappingProxyType[types.FunctionType, tuple[types.FunctionType, ...]]
-):
-    """Map runtime Python functions to their stub overloads."""
-    out = {}
-    for owner, members in _stub_overloads().items():
-        for name, ovs in members.items():
-            attr = vars(owner).get(name)
-            # unwrap __func__ from a classmethod or staticmethod
-            if isinstance(func := getattr(attr, "__func__", attr), types.FunctionType):
-                out[func] = ovs
-    return types.MappingProxyType(out)
-
-
-def _resolve_call(obj, /) -> tuple[tp.Sequence[tp.Callable], bool]:
-    """Return the overloads that calling obj calls, and whether the call binds
-    their self or cls parameter.
-    """
-
-    def lookup(mro, /, *names: str):
-        for typx in mro:
-            if (members := _stub_overloads().get(typx)) is not None:
-                decls = [members[name] for name in names if name in members]
-            else:
-                attrs = (vars(typx)[name] for name in names if name in vars(typx))
-                decls = [
-                    (
-                        tp.get_overloads(a)
-                        if isinstance(getattr(a, "__func__", a), types.FunctionType)
-                        else ()
-                    )
-                    for a in attrs
-                ]
-            if decls:
-                return max(decls, key=len)
-        return ()
-
-    objtype = type(obj)
-    if isinstance(obj, types.FunctionType) or hasattr(objtype, "__func__"):
-        ovs = tp.get_overloads(obj) or _stub_functions().get(
-            getattr(obj, "__func__", obj), ()
-        )
-        return ovs, hasattr(objtype, "__self__")
-    if hasattr(objtype, "__self__"):
-        # __self__ is None for C static methods, so get the module name
-        # or self type from __reduce__ instead.
-        match obj.__reduce__():
-            case str(name):
-                # sys.modules[obj.__module__][name] => function
-                members = _stub_overloads().get(sys.modules[obj.__module__], {})
-                return members.get(name, ()), False
-            case _, (m_self, name):
-                # getattr(m_self, name) => unbound method
-                if isinstance(m_self, type):
-                    # include the metaclass in attribute lookup
-                    mro = (*m_self.__mro__, *type(m_self).__mro__)
-                else:
-                    mro = type(m_self).__mro__
-                # special case for tp_new: __new__ is a C static method
-                # where __self__ is m_self
-                is_bound = getattr(obj, "__self__", None) is m_self
-                return lookup(mro, name), is_bound and name != "__new__"
-    if hasattr(objtype, "__objclass__"):
-        # unbound C method descriptor
-        return lookup(obj.__objclass__.__mro__, obj.__name__), False
-    call = next(
-        vars(typx)["__call__"] for typx in objtype.__mro__ if "__call__" in vars(typx)
-    )
-    if call is vars(type)["__call__"]:
-        # the constructor type.__call__ delegates to
-        return lookup(obj.__mro__, "__new__", "__init__"), True
-    if hasattr(type(call), "__get__"):
-        call = call.__get__(obj, objtype)
-    return _resolve_call(call)
-
-
-@ft.lru_cache
-def _get_signatures(*funcs: tp.Callable, is_bound=False):
-    sigs = map(
-        ft.partial(
-            inspect.signature, annotation_format=annotationlib.Format.FORWARDREF
-        ),
-        # unwrap __func__ from a classmethod or staticmethod
-        (getattr(func, "__func__", func) for func in funcs),
-    )
-    if is_bound:
-        sigs = (sig.replace(parameters=[*sig.parameters.values()][1:]) for sig in sigs)
-    return tuple(sigs)
-
-
-def _get_overloads(obj: tp.Callable, /) -> tuple[inspect.Signature, ...]:
-    if not callable(obj):
-        raise TypeError
-    ovs, is_bound = _resolve_call(obj)
-    if ovs:
-        sigs = _get_signatures(*ovs, is_bound=is_bound)
-    else:
-        sigs = (
-            inspect.signature(obj, annotation_format=annotationlib.Format.FORWARDREF),
-        )
-    if isinstance(obj, type):
-        # an unannotated or __init__ signature returns an instance of the class
-        return tuple(
-            (
-                sig.replace(return_annotation=tp.Self)
-                if sig.return_annotation in (None, inspect.Signature.empty)
-                else sig
-            )
-            for sig in sigs
-        )
-    return sigs
