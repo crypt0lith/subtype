@@ -15,10 +15,6 @@ _RECURSION_LIMIT = 16
 _TypeParameter: tp.TypeAlias = tp.TypeVar | tp.TypeVarTuple | tp.ParamSpec
 
 
-def _get_value_or_forwardref(f: tp.Callable, /):
-    return annotationlib.call_evaluate_function(f, annotationlib.Format.FORWARDREF)
-
-
 def _is_indeterminate_tuple(tup: type[tuple], /):
     return (
         (tp.get_origin(tup) or tup) is tuple
@@ -92,6 +88,10 @@ def _adjust_tuple_entries(
         packed = [t for t, _ in src[dst_i : dst_i + n]]
         src[dst_i : dst_i + n] = [(tp.Union[*packed] if packed else tp.Any, False)]
     return len(dst) == len(src)
+
+
+def _get_value_or_forwardref(f: tp.Callable, /):
+    return annotationlib.call_evaluate_function(f, annotationlib.Format.FORWARDREF)
 
 
 def _add_default_params(
