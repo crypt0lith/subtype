@@ -13,6 +13,10 @@ import weakref
 
 _RECURSION_LIMIT = 16
 _TypeParameter: tp.TypeAlias = tp.TypeVar | tp.TypeVarTuple | tp.ParamSpec
+# the signatures of each protocol member in dst, paired with those in src
+_MemberPairs: tp.TypeAlias = tuple[
+    tuple[tuple[inspect.Signature, ...], tuple[inspect.Signature, ...]], ...
+]
 
 
 def _is_indeterminate_tuple(tup: type[tuple], /):
@@ -577,6 +581,9 @@ def _get_overloads(obj: tp.Callable, /) -> tuple[inspect.Signature, ...]:
     ovs, is_bound = _resolve_call(obj)
     if ovs:
         sigs = _get_signatures(*ovs, is_bound=is_bound)
+    elif isinstance(obj, (type, types.FunctionType)):
+        # the signature of a class or function is fixed by its definition
+        sigs = _get_signatures(obj)
     else:
         sigs = (
             inspect.signature(obj, annotation_format=annotationlib.Format.FORWARDREF),
@@ -594,6 +601,7 @@ def _get_overloads(obj: tp.Callable, /) -> tuple[inspect.Signature, ...]:
     return sigs
 
 
+@ft.lru_cache
 def _generic_bases(typx: type, /) -> tuple[tuple[_TypeParameter, ...], tuple]:
     """Return the type parameters and generic bases of typx."""
     if (bases := vars(typx).get("__orig_bases__")) is None:
@@ -1115,9 +1123,8 @@ class _callable_subclasscheck(_callable_instancecheck):
         return any(_assign_signature(self.signature, sig, **ctx) for sig in sigs)
 
 
-def _member_pairs(
-    dst, src, /, *, erased=False
-) -> list[tuple[list[inspect.Signature], list[inspect.Signature]]] | None:
+@ft.lru_cache
+def _member_pairs(dst, src, /, *, erased=False) -> _MemberPairs | None:
     """Pair the signatures of each method of the protocol dst with those of the
     same method of src, with the type arguments of both substituted, or return
     None if src does not declare one of them.
@@ -1131,17 +1138,17 @@ def _member_pairs(
         if (src_member := _member_signatures(origin, name)) is None:
             return
         dst_sigs, src_sigs = (
-            [
+            tuple(
                 _substitute_signature(s, _map_args(x, owner, erased=e) or {})
                 for s in sigs
-            ]
+            )
             for x, (owner, sigs), e in (
                 (dst, dst_member, False),
                 (src, src_member, erased),
             )
         )
         pairs.append((dst_sigs, src_sigs))
-    return pairs
+    return tuple(pairs)
 
 
 def _is_subclass(src, dst: type, /) -> bool:
@@ -1155,7 +1162,7 @@ def _is_subclass(src, dst: type, /) -> bool:
 def _assign_protocol(
     dst: _SupportsGeneric,
     src,
-    pairs: list[tuple[list[inspect.Signature], list[inspect.Signature]]],
+    pairs: _MemberPairs,
     /,
     *,
     erased=False,
@@ -1320,8 +1327,22 @@ def _solve_value(dst, obj, solution: dict[_TypeParameter, tp.Any], /) -> bool:
             self_class=owner if isinstance(owner, type) else type(owner),
         )
     if (src := _infer_type(obj)) is not None:
-        return _solve(dst, src, solution)
-    return _solve(dst, type(obj), solution, erased=True)
+        ok, bound = _solve_cached(dst, src, frozenset(solution.items()))
+    else:
+        ok, bound = _solve_cached(
+            dst, type(obj), frozenset(solution.items()), erased=True
+        )
+    if ok:
+        solution.update(bound)
+    return ok
+
+
+@ft.lru_cache
+def _solve_cached(dst, src, bound: frozenset, /, *, erased=False):
+    """Return the result of _solve and the solution it extends bound to."""
+    solution = dict(bound)
+    res = _solve(dst, src, solution, erased=erased)
+    return res, frozenset(solution.items())
 
 
 def _infer_type(obj, /):
