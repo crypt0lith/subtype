@@ -49,7 +49,7 @@ def _tuple_entries(typx: type[tuple], /) -> list[tuple[tp.Any, bool]] | None:
     indeterminate, or None if typx unpacks a TypeVarTuple.
     """
     if not hasattr(typx, "__args__"):
-        # a bare tuple takes the bound of its type parameter
+        # tuple => tuple[object, ...]
         return [(object, True)]
     if _is_indeterminate_tuple(typx):
         return [(tp.get_args(typx)[0], True)]
@@ -591,14 +591,13 @@ def _get_overloads(obj: tp.Callable, /) -> tuple[inspect.Signature, ...]:
     if ovs:
         sigs = _get_signatures(*ovs, is_bound=is_bound)
     elif isinstance(obj, (type, types.FunctionType)):
-        # the signature of a class or function is fixed by its definition
         sigs = _get_signatures(obj)
     else:
         sigs = (
             inspect.signature(obj, annotation_format=annotationlib.Format.FORWARDREF),
         )
     if isinstance(obj, type):
-        # an unannotated or __init__ signature returns an instance of the class
+        # an unannotated or __init__ signature returns Self
         return tuple(
             (
                 sig.replace(return_annotation=tp.Self)
@@ -629,7 +628,7 @@ def _generic_bases(typx: type, /) -> tuple[tuple[_TypeParameter, ...], tuple]:
     for base in bases:
         if tp.get_origin(base) in (tp.Generic, tp.Protocol):
             return tp.get_args(base), bases
-    # a bare typing alias like typing.MappingView has no __parameters__
+    # only subclasses of _GenericAlias have a __parameters__ attribute
     params = (
         p for b in bases if tp.get_origin(b) for p in getattr(b, "__parameters__", ())
     )
@@ -642,7 +641,6 @@ def _is_protocol(typx: type, /) -> bool:
 
 
 def _default_arg(param: tp.TypeVar, /, *, erased: bool):
-    # a value's type arguments are erased at runtime
     if erased:
         return tp.Any
     if param.has_default():
@@ -662,7 +660,9 @@ def _type_args(
     if tp.get_origin(typx) is builtins.tuple and hasattr(typx, "__args__"):
         if (entries := _tuple_entries(typx)) is None:
             return
-        # the type parameter of tuple is the union of its elements
+        # squash tuple type params into a union
+        #   tuple[str, int] => (str | int,)
+        #   tuple[()] => (Never,)
         args = (tp.Union[*(t for t, _ in entries)] if entries else tp.Never,)
     subst: dict[tp.TypeVar, tp.Any] = {}
     for i, param in enumerate(params):
@@ -703,7 +703,6 @@ def _specialize(src, dst: type, /, *, erased: bool):
     """Return the base of src whose origin is dst, with the type arguments of
     src substituted, or None if no generic base of src leads to dst.
     """
-    # issubclass raises for a protocol that is not runtime-checkable
     is_protocol = _is_protocol(dst)
     stack: list[tuple[tp.Any, tp.Mapping]] = [(src, {})]
     while stack:
@@ -711,13 +710,12 @@ def _specialize(src, dst: type, /, *, erased: bool):
         origin = tp.get_origin(typx) or typx
         if origin is dst:
             return _substitute(typx, subst)
-        # a base that is not a subclass of dst cannot lead to it
         if not (isinstance(origin, type) and (is_protocol or issubclass(origin, dst))):
             continue
         params, bases = _generic_bases(origin)
         if (args := _type_args(typx, params, erased=erased)) is None:
             continue
-        # map the type parameters of origin to the arguments of src
+        # map type params of origin to args of src
         subst = {p: _substitute(a, subst) for p, a in args.items()}
         stack += [(base, subst) for base in bases[::-1]]
 
@@ -741,7 +739,7 @@ def _get_member_overloads(owner: type, name: str, /) -> tp.Sequence[tp.Callable]
     func = owner.__dict__[name]
     func = getattr(func, "__func__", func)
     if func is tp._overload_dummy:
-        # only exists as overloads, no runtime function
+        # only exists as overloads; no runtime function
         return list(
             tp._overload_registry.get(owner.__module__, {})
             .get(f"{owner.__qualname__}.{name}", {})
@@ -765,7 +763,6 @@ def _member_signatures(
         attr = vars(owner).get(name)
         if isinstance(getattr(attr, "__func__", attr), types.FunctionType):
             ovs = _get_member_overloads(owner, name) or (attr,)
-            # an outermost @overload leaves the bare dummy as attr
             is_bound = not isinstance(ovs[0], staticmethod)
             return owner, _get_signatures(*ovs, is_bound=is_bound)
 
@@ -779,7 +776,6 @@ def _protocol_members(typx: type, /) -> set[str]:
         if (members := _stub_overloads().get(base)) is not None:
             names |= members.keys()
         else:
-            # __protocol_attrs__ leaves out the methods typing adds
             names |= {
                 name
                 for name in base.__protocol_attrs__
@@ -802,7 +798,6 @@ def _assign_type(dst: subtype, src, /, **ctx: tp.Unpack[_AssignContext]) -> bool
         case tp.Union:
             return all(_assign_type(dst, arg, **ctx) for arg in src.__args__)
         case tp.Literal if len(src.__args__) > 1:
-            # a union dst can accept each value from a different member
             return all(
                 _assign_type(dst, tp.Literal[arg], **ctx) for arg in src.__args__
             )
@@ -811,7 +806,7 @@ def _assign_type(dst: subtype, src, /, **ctx: tp.Unpack[_AssignContext]) -> bool
         case tp.TypeAliasType() | tp.ForwardRef():
             if "assuming" not in ctx:
                 ctx["assuming"] = frozenset()
-            # a recursive alias reaches the same pair again, which then holds
+            # a self-referential alias is its own cyclic lower bound
             if (dst, src) in ctx["assuming"]:
                 return True
             ctx["assuming"] |= {(dst, src)}
@@ -828,8 +823,6 @@ def _assign_type(dst: subtype, src, /, **ctx: tp.Unpack[_AssignContext]) -> bool
             return _assign_type(dst, src.__bound__ or object, **ctx)
         case builtins.type if tp.get_args(src):
             [arg] = tp.get_args(src)
-            # type[...] distributes over a union, and takes the bound or
-            # constraints of a TypeVar
             if tp.get_origin(arg) is tp.Union:
                 return all(_assign_type(dst, type[a], **ctx) for a in arg.__args__)
             if isinstance(arg, tp.TypeVar):
@@ -870,7 +863,6 @@ def _declared_types(typx: type, /) -> list[tuple[tp.Any, _AssignFlag]]:
         if final or (name.startswith("_") and not dunder):
             out.append((form, _AssignFlag.DEFAULT))
         else:
-            # a frozen dataclass or NamedTuple field is replaceable by __replace__
             out.append((form, _AssignFlag.INVARIANT))
     for name, attr in vars(typx).items():
         if name in ("__new__", "__init__"):
@@ -934,7 +926,6 @@ def _infer_variance(
         for x, args in zip(bounds, bound_args):
             args[i] = x
         upper, lower = (typx[*b] for b in bound_args)
-        # references to typx in its members compare by the assumed variance
         if _assign_class_to_self(
             upper,
             lower,
@@ -973,7 +964,6 @@ def _variance(
 
 class _literal_instancecheck(_checker):
     def __call__(self, obj, /, **__):
-        # Literal[1] excludes True
         return any(type(obj) is type(a) and obj == a for a in self.__args__)
 
 
@@ -1092,7 +1082,6 @@ def _assign_signature(
     solution: dict[_TypeParameter, tp.Any] = {}
     src_params = [*src.parameters.values()]
     for dst_param in dst.parameters.values():
-        # the ... of dst accepts the remaining parameters of src
         if dst_param.kind is not inspect.Parameter.POSITIONAL_ONLY:
             src_params = []
             break
@@ -1138,7 +1127,7 @@ class _callable_instancecheck(_checker):
     def __call__(self, obj, /, **ctx):
         if not callable(obj):
             return False
-        # Self in the signature of obj is the class obj binds to
+        # bind Self to the self class of the callable
         owner = getattr(obj, "__self__", obj)
         ctx["self_class"] = owner if isinstance(owner, type) else type(owner)
         return any(
@@ -1159,7 +1148,6 @@ class _callable_subclasscheck(_callable_instancecheck):
             if (member := _member_signatures(origin, "__call__")) is not None:
                 owner, sigs = member
                 if not tp.get_args(obj) and (params := _generic_bases(origin)[0]):
-                    # a bare class leaves its type parameters to be solved
                     obj = types.GenericAlias(
                         origin,
                         tuple(p.__default__ if p.has_default() else p for p in params),
@@ -1223,11 +1211,14 @@ def _assign_protocol(
 ) -> bool:
     if "assuming" not in ctx:
         ctx["assuming"] = frozenset()
-    # a recursive member reaches the same pair again, which then holds
-    if (subtype(dst), src) in ctx["assuming"]:
+    # a self-referential member is its own cyclic lower bound.
+    # e.g., the stub for Iterator.__iter__ returns itself:
+    #
+    #   __iter__(self) -> Iterator[_T_co]: ...
+    #
+    if (item := (subtype(dst), src)) in ctx["assuming"]:
         return True
-    ctx["assuming"] |= {(subtype(dst), src)}
-    # Self in the members of dst and src is src
+    ctx["assuming"] |= {item}
     ctx["self_class"] = _erase(src) if erased else src
     return all(
         any(_assign_signature(d, s, **ctx) for s in src_sigs)
@@ -1338,7 +1329,7 @@ def _solve(
         return all(_solve(dst, s, solution, assuming=assuming) for s in src.__args__)
     if not isinstance(origin, type):
         return False
-    # a recursive member reaches the same pair again, which then holds
+    # a self-referential member is its own cyclic lower bound.
     if (dst, src) in assuming:
         return True
     assuming |= {(dst, src)}
@@ -1378,9 +1369,7 @@ def _solve_value(dst, obj, solution: dict[_TypeParameter, tp.Any], /) -> bool:
         try:
             sigs = _get_overloads(obj)
         except ValueError:
-            # obj has no signature to bind from
             return True
-        # Self in the signature of obj is the class obj binds to
         owner = getattr(obj, "__self__", obj)
         return _solve_signature(
             _callable_signature(dst),
@@ -1401,7 +1390,8 @@ def _solve_value(dst, obj, solution: dict[_TypeParameter, tp.Any], /) -> bool:
             and isinstance(obj, collections.abc.Collection)
             and (args := _map_args(dst, collections.abc.Iterable, erased=False))
         ):
-            # the items of a collection give the type arguments that were erased
+            # dst is Iterable and obj is a Collection, so can be walked
+            # to obtain runtime types without exhausting the iterable.
             [item] = args.values()
             bound = frozenset(solution.items())
             for t in set(map(type, obj)):
@@ -1440,7 +1430,6 @@ def _infer_type(obj, /):
     try:
         sigs = _get_overloads(func)
     except ValueError:
-        # func has no signature to infer from
         return
     for sig in sigs:
         try:
@@ -1457,7 +1446,6 @@ def _infer_type(obj, /):
         ):
             continue
         ret = sig.return_annotation
-        # an undeclared return type says nothing about obj
         if ret is sig.empty:
             return
         if ret is tp.Self:
@@ -1499,7 +1487,7 @@ class _generic_instancecheck(_checker):
         if (seen := ctx.get("seen")) is None:
             seen = ctx["seen"] = set()
         key = (id(obj), self.__form__)
-        # a cycle reaches the same pair again, which then holds
+        # a cycle has occurred, and is assignable to itself.
         if not nested or recursion_count > _RECURSION_LIMIT or key in seen:
             return True
         seen.add(key)
@@ -1536,10 +1524,8 @@ class _type_subclasscheck(_type_instancecheck):
     def __call__(self, obj, /, **ctx):
         origin = tp.get_origin(obj) or obj
         if origin is builtins.type:
-            # a bare type is type[Any]
             [arg] = tp.get_args(obj) or [tp.Any]
         elif isinstance(origin, type) and issubclass(origin, builtins.type):
-            # an instance of a metaclass is a class
             arg = object
         else:
             return False
