@@ -1559,6 +1559,8 @@ class subtype(type):
     __subtype_instancecheck__: _checker
     __subtype_subclasscheck__: _checker
 
+    @tp.no_type_check
+    @staticmethod
     def __new__(mcls, typx, /):
         if isinstance(typx, mcls):
             if type(typx) is mcls:
@@ -1675,7 +1677,7 @@ class subtype(type):
     def __call__(cls) -> tp.Never:
         raise TypeError(f"cannot instantiate {type(cls).__qualname__} objects")
 
-    def __or__[T: subtype](cls: T, other, /) -> T:
+    def __or__(cls, other, /):
         if isinstance(other, mcls := type(cls)):
             return mcls(cls.__subtype_form__ | other.__subtype_form__)
         try:
@@ -1683,7 +1685,7 @@ class subtype(type):
         except NotImplementedError, TypeError:
             return NotImplemented
 
-    def __ror__[T: subtype](cls: T, other, /) -> T:
+    def __ror__(cls, other, /):
         try:
             return cls.__class__(other | cls.__subtype_form__)
         except NotImplementedError, TypeError:
