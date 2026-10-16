@@ -21,6 +21,9 @@ def k(x: int, *, y: str) -> str: ...
 def any_args(*args, **kwargs): ...
 
 
+def ident[S](x: S) -> S: ...
+
+
 @tp.overload
 def ov(x: int) -> int: ...
 @tp.overload
@@ -44,6 +47,35 @@ class Fn(tp.Protocol):
 
 class Fn2:
     def __call__(self, x: int, y: int) -> int: ...
+
+
+class Gen[T](tp.Protocol):
+    def __call__(self, x: T) -> T: ...
+
+
+class GenSub[T](Gen[T], tp.Protocol): ...
+
+
+class OverloadCall(tp.Protocol):
+    @tp.overload
+    def __call__(self, x: int) -> int: ...
+    @tp.overload
+    def __call__(self, x: str) -> str: ...
+
+
+class Identity(tp.Protocol):
+    def __call__[S](self, x: S) -> S: ...
+
+
+class IdentityIntBound(tp.Protocol):
+    def __call__[S: int](self, x: S) -> S: ...
+
+
+class Forward[**P](tp.Protocol):
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> int: ...
+
+
+P = tp.ParamSpec("P")
 
 
 @pytest.mark.parametrize(
@@ -125,6 +157,23 @@ def test_instance_keyword_only(obj, dst, expected):
     ],
 )
 def test_instance_overload(obj, dst, expected):
+    assert isinstance(obj, subtype(dst)) is expected
+
+
+def test_instance_generic_function():
+    assert isinstance(ident, subtype(tp.Callable[[int], int]))
+
+
+@pytest.mark.parametrize(
+    "obj, dst, expected",
+    [
+        (f, tp.Callable[P, str], True),
+        (f, tp.Callable[P, int], False),
+        (f, tp.Callable[tp.Concatenate[int, P], str], True),
+        (f, tp.Callable[tp.Concatenate[str, P], str], False),
+    ],
+)
+def test_instance_paramspec(obj, dst, expected):
     assert isinstance(obj, subtype(dst)) is expected
 
 
@@ -211,6 +260,56 @@ def test_subclass_dunder_call(src, dst, expected):
 @pytest.mark.parametrize(
     "src, dst, expected",
     [
+        (Gen[str], tp.Callable[[str], str], True),
+        (Gen[str], tp.Callable[[int], int], False),
+        (Gen[bool], tp.Callable[[bool], int], True),
+        (GenSub[int], tp.Callable[[int], int], True),
+        (GenSub[int], tp.Callable[[str], str], False),
+        (Gen, tp.Callable[[int], int], True),
+        (Gen, tp.Callable[[int], str], False),
+    ],
+)
+def test_subclass_generic_protocol(src, dst, expected):
+    assert issubclass(src, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "src, dst, expected",
+    [
+        (OverloadCall, tp.Callable[[int], int], True),
+        (OverloadCall, tp.Callable[[str], str], True),
+        (OverloadCall, tp.Callable[[bytes], bytes], False),
+    ],
+)
+def test_subclass_overload_protocol(src, dst, expected):
+    assert issubclass(src, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "src, dst, expected",
+    [
+        (Identity, tp.Callable[[int], int], True),
+        (IdentityIntBound, tp.Callable[[str], object], False),
+    ],
+)
+def test_subclass_method_typevar(src, dst, expected):
+    assert issubclass(src, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "src, dst, expected",
+    [
+        (Forward, tp.Callable[[int], int], True),
+        (Forward, tp.Callable[[int], str], False),
+    ],
+)
+def test_subclass_paramspec(src, dst, expected):
+    assert issubclass(src, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "src, dst, expected",
+    [
         (int, tp.Callable[..., tp.Any], False),
         (tp.Literal[1], tp.Callable[..., tp.Any], False),
     ],
@@ -219,5 +318,6 @@ def test_subclass_not_callable(src, dst, expected):
     assert issubclass(src, subtype(dst)) is expected
 
 
-def test_subclass_union():
-    assert issubclass(tp.Callable[[int], str] | Fn, subtype(tp.Callable[[int], object]))
+@pytest.mark.parametrize("src", [tp.Callable[[int], str] | Fn, Fn | Gen[int]])
+def test_subclass_union(src):
+    assert issubclass(src, subtype(tp.Callable[[int], object]))

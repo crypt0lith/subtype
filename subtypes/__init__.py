@@ -512,14 +512,16 @@ def _resolve_call(obj, /) -> tuple[tp.Sequence[tp.Callable], bool]:
             if (members := _stub_overloads().get(typx)) is not None:
                 decls = [members[name] for name in names if name in members]
             else:
-                attrs = (vars(typx)[name] for name in names if name in vars(typx))
+                attrs = (
+                    (name, vars(typx)[name]) for name in names if name in vars(typx)
+                )
                 decls = [
                     (
-                        tp.get_overloads(a)
+                        _get_member_overloads(typx, name)
                         if isinstance(getattr(a, "__func__", a), types.FunctionType)
                         else ()
                     )
-                    for a in attrs
+                    for name, a in attrs
                 ]
             if decls:
                 return max(decls, key=len)
@@ -553,12 +555,16 @@ def _resolve_call(obj, /) -> tuple[tp.Sequence[tp.Callable], bool]:
     if hasattr(objtype, "__objclass__"):
         # unbound C method descriptor
         return lookup(obj.__objclass__.__mro__, obj.__name__), False
-    call = next(
-        vars(typx)["__call__"] for typx in objtype.__mro__ if "__call__" in vars(typx)
-    )
+    owner = next(typx for typx in objtype.__mro__ if "__call__" in vars(typx))
+    call = vars(owner)["__call__"]
     if call is vars(type)["__call__"]:
         # the constructor type.__call__ delegates to
         return lookup(obj.__mro__, "__new__", "__init__"), True
+    # binding loses the owner that overload-only declarations are keyed by
+    if isinstance(getattr(call, "__func__", call), types.FunctionType) and (
+        ovs := _get_member_overloads(owner, "__call__")
+    ):
+        return ovs, not isinstance(ovs[0], staticmethod)
     if hasattr(type(call), "__get__"):
         call = call.__get__(obj, objtype)
     return _resolve_call(call)
@@ -731,6 +737,19 @@ def _erase(typx: type, /):
     return types.GenericAlias(typx, (tp.Any,) * len(params)) if params else typx
 
 
+def _get_member_overloads(owner: type, name: str, /) -> tp.Sequence[tp.Callable]:
+    func = owner.__dict__[name]
+    func = getattr(func, "__func__", func)
+    if func is tp._overload_dummy:
+        # only exists as overloads, no runtime function
+        return list(
+            tp._overload_registry.get(owner.__module__, {})
+            .get(f"{owner.__qualname__}.{name}", {})
+            .values()
+        )
+    return tp.get_overloads(func)
+
+
 def _member_signatures(
     typx: type, name: str, /
 ) -> tuple[type, tuple[inspect.Signature, ...]] | None:
@@ -744,9 +763,10 @@ def _member_signatures(
                 return owner, _get_signatures(*members[name], is_bound=True)
             continue
         attr = vars(owner).get(name)
-        if isinstance(func := getattr(attr, "__func__", attr), types.FunctionType):
-            ovs = tp.get_overloads(func) or (func,)
-            is_bound = not isinstance(attr, staticmethod)
+        if isinstance(getattr(attr, "__func__", attr), types.FunctionType):
+            ovs = _get_member_overloads(owner, name) or (attr,)
+            # an outermost @overload leaves the bare dummy as attr
+            is_bound = not isinstance(ovs[0], staticmethod)
             return owner, _get_signatures(*ovs, is_bound=is_bound)
 
 
@@ -855,7 +875,6 @@ def _declared_types(typx: type, /) -> list[tuple[tp.Any, _AssignFlag]]:
     for name, attr in vars(typx).items():
         if name in ("__new__", "__init__"):
             continue
-        is_bound = not isinstance(attr, staticmethod)
         if isinstance(attr, property):
             funcs = (attr.fget, attr.fset, attr.fdel)
         else:
@@ -864,7 +883,11 @@ def _declared_types(typx: type, /) -> list[tuple[tp.Any, _AssignFlag]]:
             func = getattr(func, "__func__", func)
             if not isinstance(func, types.FunctionType):
                 continue
-            ovs = tp.get_overloads(func) or (func,)
+            if isinstance(attr, property):
+                ovs = tp.get_overloads(func) or (func,)
+            else:
+                ovs = _get_member_overloads(typx, name) or (attr,)
+            is_bound = not isinstance(ovs[0], staticmethod)
             for sig in _get_signatures(*ovs, is_bound=is_bound):
                 out += [
                     (p.annotation, _AssignFlag.CONTRAVARIANT)
@@ -1032,8 +1055,6 @@ def _callable_signature(typx: _SupportsGeneric, /) -> inspect.Signature:
         tail = None
     else:
         params, tail = [], params
-    if isinstance(tail, tp.ParamSpec):
-        raise NotImplementedError
     sig = [
         inspect.Parameter(f"_{i}", inspect.Parameter.POSITIONAL_ONLY, annotation=t)
         for i, t in enumerate(params)
@@ -1042,6 +1063,15 @@ def _callable_signature(typx: _SupportsGeneric, /) -> inspect.Signature:
         sig += [
             inspect.Parameter("args", inspect.Parameter.VAR_POSITIONAL),
             inspect.Parameter("kwargs", inspect.Parameter.VAR_KEYWORD),
+        ]
+    elif isinstance(tail, tp.ParamSpec):
+        sig += [
+            inspect.Parameter(
+                "args", inspect.Parameter.VAR_POSITIONAL, annotation=tail.args
+            ),
+            inspect.Parameter(
+                "kwargs", inspect.Parameter.VAR_KEYWORD, annotation=tail.kwargs
+            ),
         ]
     return inspect.Signature(sig, return_annotation=ret)
 
@@ -1054,32 +1084,53 @@ def _assign_signature(
     def annotation(typx, /):
         return tp.Any if typx is inspect.Parameter.empty else typx
 
-    if not _assign_with_variance(
-        dst.return_annotation, annotation(src.return_annotation), **ctx
-    ):
-        return False
+    shared = {
+        p
+        for typx in (
+            dst.return_annotation,
+            *(q.annotation for q in dst.parameters.values()),
+        )
+        for p in _free_params(typx)
+    }
+    solution: dict[_TypeParameter, tp.Any] = {}
     src_params = [*src.parameters.values()]
     for dst_param in dst.parameters.values():
         # the ... of dst accepts the remaining parameters of src
         if dst_param.kind is not inspect.Parameter.POSITIONAL_ONLY:
-            return True
+            src_params = []
+            break
         if not src_params or src_params[0].kind > inspect.Parameter.VAR_POSITIONAL:
             return False
         if src_params[0].kind is inspect.Parameter.VAR_POSITIONAL:
             src_param = src_params[0]
         else:
             src_param = src_params.pop(0)
+        src_annotation = annotation(src_param.annotation)
+        if not shared.intersection(_free_params(src_annotation)):
+            _solve(src_annotation, dst_param.annotation, solution)
         if not _assign_with_variance(
             dst_param.annotation,
-            annotation(src_param.annotation),
+            _substitute(src_annotation, solution),
             _AssignFlag.CONTRAVARIANT,
             **ctx,
         ):
             return False
-    return all(
+    if not all(
         p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
         or p.default is not inspect.Parameter.empty
         for p in src_params
+    ):
+        return False
+    if not all(
+        _assign_type(subtype(p), t, **ctx)
+        for p, t in solution.items()
+        if isinstance(p, tp.TypeVar)
+    ):
+        return False
+    return _assign_with_variance(
+        dst.return_annotation,
+        _substitute(annotation(src.return_annotation), solution),
+        **ctx,
     )
 
 
@@ -1108,9 +1159,20 @@ class _callable_subclasscheck(_callable_instancecheck):
             [ctx["self_class"]] = tp.get_args(obj)
             sigs = _get_overloads(tp.get_origin(ctx["self_class"]) or ctx["self_class"])
         elif isinstance(origin, type) and issubclass(origin, collections.abc.Callable):
-            call = inspect.getattr_static(origin, "__call__")
-            ovs, _ = _resolve_call(call)
-            sigs = _get_signatures(*(ovs or (call,)), is_bound=True)
+            if (member := _member_signatures(origin, "__call__")) is not None:
+                owner, sigs = member
+                if not tp.get_args(obj) and (params := _generic_bases(origin)[0]):
+                    # a bare class leaves its type parameters to be solved
+                    obj = types.GenericAlias(
+                        origin,
+                        tuple(p.__default__ if p.has_default() else p for p in params),
+                    )
+                subst = _map_args(obj, owner, erased=False) or {}
+                sigs = tuple(_substitute_signature(s, subst) for s in sigs)
+            else:
+                call = inspect.getattr_static(origin, "__call__")
+                ovs, _ = _resolve_call(call)
+                sigs = _get_signatures(*(ovs or (call,)), is_bound=True)
         else:
             return False
         return any(_assign_signature(self.signature, sig, **ctx) for sig in sigs)
@@ -1487,6 +1549,24 @@ class _type_subclasscheck(_type_instancecheck):
         return _assign_type(self.__form__, arg, **ctx)
 
 
+class _typevar_instancecheck(_checker):
+    def __init__(self, typx: tp.TypeVar, /):
+        self.__form__ = typx
+
+    def bounds(self) -> tuple[tp.Any, ...]:
+        return self.__form__.__constraints__ or (self.__form__.__bound__ or object,)
+
+    def __call__(self, obj, /, **ctx):
+        return any(
+            subtype(t).__subtype_instancecheck__(obj, **ctx) for t in self.bounds()
+        )
+
+
+class _typevar_subclasscheck(_typevar_instancecheck):
+    def __call__(self, obj, /, **ctx):
+        return any(_assign_type(subtype(t), obj, **ctx) for t in self.bounds())
+
+
 _subtypes = weakref.WeakValueDictionary()
 _inferred_variance = weakref.WeakKeyDictionary()
 
@@ -1501,7 +1581,12 @@ class subtype(type):
             if type(typx) is mcls:
                 return typx
             typx = typx.__subtype_form__
-        if (cls := _subtypes.get(typx)) is not None:
+        # ParamSpecArgs and ParamSpecKwargs are not hashable
+        if not callable(getattr(type(typx), "__hash__", None)):
+            key = type(typx), tp.get_origin(typx)
+        else:
+            key = typx
+        if (cls := _subtypes.get(key)) is not None:
             return cls
 
         i_check = "__subtype_instancecheck__"
@@ -1573,13 +1658,22 @@ class subtype(type):
             case type():
                 namespace[i_check] = _generic_instancecheck(typx)
                 namespace[s_check] = _generic_subclasscheck(typx)
+            case tp.TypeVar():
+                namespace[i_check] = _typevar_instancecheck(typx)
+                namespace[s_check] = _typevar_subclasscheck(typx)
+            # the origin of P.args / P.kwargs is a ParamSpec reference.
+            # key is tuple[type[_], P] here, since typx is not hashable.
+            case tp.ParamSpec() if key is not typx:
+                namespace.update(
+                    dict.fromkeys((i_check, s_check), lambda _, **__: True)
+                )
             # TODO: implement these
-            case tp.TypeVar() | str() | tp.LiteralString | tp.TypeGuard | tp.TypeIs:
+            case str() | tp.LiteralString | tp.TypeGuard | tp.TypeIs:
                 raise NotImplementedError
             case _:
                 raise TypeError
         return _subtypes.setdefault(
-            typx, super().__new__(mcls, mcls.__name__, (), namespace)
+            key, super().__new__(mcls, mcls.__name__, (), namespace)
         )
 
     def __repr__(cls):

@@ -66,6 +66,13 @@ class Overload[T]:
     def f(self, x): ...
 
 
+class OverloadOnly[T]:
+    @tp.overload
+    def f(self, x: T) -> None: ...
+    @tp.overload
+    def f(self, x: str) -> None: ...
+
+
 class Property[T]:
     @property
     def item(self) -> T: ...
@@ -176,9 +183,10 @@ def test_subclass_method_param(cls, co, contra):
     assert issubclass(cls[int], subtype(cls[bool])) is contra
 
 
-def test_subclass_overload():
-    assert not issubclass(Overload[bool], subtype(Overload[int]))
-    assert issubclass(Overload[int], subtype(Overload[bool]))
+@pytest.mark.parametrize("cls", [Overload, OverloadOnly])
+def test_subclass_overload(cls):
+    assert not issubclass(cls[bool], subtype(cls[int]))
+    assert issubclass(cls[int], subtype(cls[bool]))
 
 
 @pytest.mark.parametrize(

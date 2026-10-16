@@ -16,6 +16,7 @@ type NestedInts = int | list[NestedInts]
 T = tp.TypeVar("T", bound=int)
 C = tp.TypeVar("C", int, str)
 U = tp.TypeVar("U")
+P = tp.ParamSpec("P")
 
 
 @pytest.mark.parametrize(
@@ -193,6 +194,38 @@ def test_subclass_typevar(src, dst, expected):
 
 
 @pytest.mark.parametrize(
+    "obj, dst, expected",
+    [
+        (1, T, True),
+        ("a", T, False),
+        ("a", C, True),
+        (b"", C, False),
+        (object(), U, True),
+    ],
+)
+def test_instance_typevar(obj, dst, expected):
+    assert isinstance(obj, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "src, dst, expected",
+    [(bool, T, True), (str, T, False), (str, C, True), (bytes, C, False)],
+)
+def test_subclass_typevar_dst(src, dst, expected):
+    assert issubclass(src, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize("obj, expected", [(bool, True), (str, False)])
+def test_instance_type_typevar(obj, expected):
+    assert isinstance(obj, subtype(type[T])) is expected
+
+
+@pytest.mark.parametrize("typx", [T, P.args])
+def test_type_parameter_form(typx):
+    assert subtype(typx).__subtype_form__ is typx
+
+
+@pytest.mark.parametrize(
     "src, dst, expected",
     [
         (list[int], collections.abc.Iterable, True),
@@ -208,12 +241,9 @@ def test_subclass_forwardref():
     assert issubclass(tp.ForwardRef("bool"), subtype(int))
 
 
-@pytest.mark.parametrize(
-    "dst", [type[T], tp.Callable[tp.ParamSpec("P"), int], T, "int"]
-)
-def test_not_implemented(dst):
+def test_not_implemented():
     with pytest.raises(NotImplementedError):
-        subtype(dst)
+        subtype("int")
 
 
 def test_cache():
