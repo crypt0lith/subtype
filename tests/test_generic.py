@@ -42,7 +42,6 @@ type J3 = list[list[J3]]
         (list[int], collections.abc.Iterable[int], True),
         (list[bool], collections.abc.Iterable[int], True),
         (list[str], collections.abc.Iterable[int], False),
-        (list[int], collections.abc.Iterable[float], True),
         (tp.Sequence[int], tp.Iterable[int], True),
         (frozenset[int], tp.AbstractSet[int], True),
     ],
@@ -147,7 +146,7 @@ def test_subclass_user_generic(src, dst, expected):
 @pytest.mark.parametrize(
     "src, dst, expected",
     [
-        (dict[str, int], collections.abc.Mapping[str, float], True),
+        (dict[str, bool], collections.abc.Mapping[str, int], True),
         (dict[str, int], collections.abc.Mapping[bytes, int], False),
         (dict[bool, int], collections.abc.Mapping[int, int], False),
         (

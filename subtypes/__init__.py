@@ -984,12 +984,9 @@ class _literal_subclasscheck(_literal_instancecheck):
         )
 
 
-_PROMOTIONS = {float: (float, int), complex: (complex, float, int)}
-
-
 class _nominal_instancecheck(_checker):
     def __init__(self, typx: type, /):
-        self.__args__ = _PROMOTIONS.get(typx, (typx,))
+        self.__args__ = (typx,)
 
     def __call__(self, obj, /, **__):
         return isinstance(obj, self.__args__)

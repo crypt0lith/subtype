@@ -44,7 +44,7 @@ def test_subclass_fixed(src, dst, expected):
         (tuple[int, int], tuple[int, ...], True),
         (tuple[()], tuple[int, ...], True),
         (tuple[int, ...], tuple[int, int], False),
-        (tuple[int, ...], tuple[float, ...], True),
+        (tuple[bool, ...], tuple[int, ...], True),
     ],
 )
 def test_subclass_homogeneous(src, dst, expected):
@@ -196,7 +196,7 @@ def test_instance_fixed(obj, dst, expected):
         ((), tuple[int, ...], True),
         ((1, 2, 3), tuple[int, ...], True),
         ((1, "a"), tuple[int, ...], False),
-        ((1, 2.0), tuple[float, ...], True),
+        ((True, 2), tuple[int, ...], True),
     ],
 )
 def test_instance_homogeneous(obj, dst, expected):

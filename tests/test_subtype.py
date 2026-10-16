@@ -19,11 +19,9 @@ U = tp.TypeVar("U")
 P = tp.ParamSpec("P")
 
 
-@pytest.mark.parametrize(
-    "obj, dst, expected", [(1, float, True), (1.0, complex, True), ("a", float, False)]
-)
-def test_instance_promotion(obj, dst, expected):
-    assert isinstance(obj, subtype(dst)) is expected
+@pytest.mark.parametrize("obj, dst", [(1, float), (1.0, complex)])
+def test_instance_no_promotion(obj, dst):
+    assert not isinstance(obj, subtype(dst))
 
 
 @pytest.mark.parametrize(
@@ -96,7 +94,7 @@ def test_instance_bare_abc(obj, dst, expected):
 
 
 @pytest.mark.parametrize(
-    "src, dst, expected", [(bool, int, True), (int, float, True), (float, int, False)]
+    "src, dst, expected", [(bool, int, True), (int, float, False), (float, int, False)]
 )
 def test_subclass_nominal(src, dst, expected):
     assert issubclass(src, subtype(dst)) is expected

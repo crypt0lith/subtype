@@ -60,7 +60,7 @@ class Wrapped[T](Reduces):
     "src, dst, expected",
     [
         (IntGetter, SupportsGet[int], True),
-        (IntGetter, SupportsGet[float], True),
+        (IntGetter, SupportsGet[object], True),
         (IntGetter, SupportsGet[str], False),
         (Nothing, SupportsGet[int], False),
     ],
