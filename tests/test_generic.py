@@ -30,7 +30,7 @@ class Box[T]:
 
 
 type Ints = list[int]
-type Json = int | list[Json]
+type NestedInts = int | list[NestedInts]
 type J1 = list[J1]
 type J2 = list[J2]
 type J3 = list[list[J3]]
@@ -118,8 +118,8 @@ type J3 = list[list[J3]]
         (Box[int], Box[int], True),
         (Box[bool], Box[int], True),
         (Box[int], Box[bool], False),
-        (list[Json], Json, True),
-        (list[int], Json, False),
+        (list[NestedInts], NestedInts, True),
+        (list[int], NestedInts, False),
         (J1, J2, True),
         (J1, J3, True),
         (list[J1], J2, True),
@@ -150,9 +150,32 @@ def test_subclasscheck(src, dst, expected):
         (Box[int](), Box[int], True),
         (Box[str](), Box[int], False),
         (Box(), Box[int], True),
-        ([1, [2]], Json, True),
-        ("a", Json, False),
+        ([1, [2]], NestedInts, True),
+        ([1, ["a"]], NestedInts, False),
+        ([[1], [2, ["a"]]], NestedInts, False),
+        ([["a"]], list[list[int] | list[bytes]], False),
+        ("a", NestedInts, False),
+        (["a"], list[int], False),
+        ([True], collections.abc.Sequence[int], True),
+        ({1: 1}, collections.abc.Mapping[str, int], False),
+        ({"a": 1}, collections.abc.Mapping[str, int], True),
+        ("ab", collections.abc.Sequence[collections.abc.Sequence[str]], True),
     ],
 )
 def test_instancecheck(obj, dst, expected):
     assert isinstance(obj, subtype(dst)) is expected
+
+
+@pytest.fixture(params=[1, 2], ids=["direct", "indirect"])
+def cycle(request):
+    lists = [[] for _ in range(request.param)]
+    for a, b in zip(lists, lists[1:] + lists[:1]):
+        a.append(b)
+    return lists[0]
+
+
+@pytest.mark.parametrize(
+    "dst, expected", [(NestedInts, True), (list[list[int]], False)]
+)
+def test_cycle(cycle, dst, expected):
+    assert isinstance(cycle, subtype(dst)) is expected

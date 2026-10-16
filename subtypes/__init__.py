@@ -249,6 +249,8 @@ class _AssignFlag(enum.IntFlag):
 class _AssignContext(tp.TypedDict, total=False):
     assuming: frozenset[tuple[subtype, tp.Any]]
     assumed_variance: tp.Mapping[type, _AssignFlag]
+    recursion_count: int
+    seen: set[tuple[int, tp.Any]]
     self_class: tp.Any
 
 
@@ -1142,7 +1144,8 @@ def _member_pairs(dst, src, /, *, erased=False) -> _MemberPairs | None:
     return tuple(pairs)
 
 
-def _is_subclass(src, dst: type, /) -> bool:
+@ft.lru_cache
+def _issubclass(src, dst: type, /) -> bool:
     try:
         return issubclass(tp.get_origin(src) or src, dst)
     except TypeError:
@@ -1184,7 +1187,7 @@ def _assign_generic(
         and (pairs := _member_pairs(dst, src, erased=erased)) is not None
     ):
         return _assign_protocol(dst, src, pairs, erased=erased, **ctx)
-    if not _is_subclass(src, dst.__origin__):
+    if not _issubclass(src, dst.__origin__):
         return False
     dst_args = _map_args(dst, dst.__origin__, erased=False)
     if src_args is None or dst_args is None:
@@ -1293,7 +1296,7 @@ def _solve(
     if not _is_protocol(origin):
         return False
     if (pairs := _member_pairs(dst, src, erased=erased)) is None:
-        return _is_subclass(src, origin)
+        return _issubclass(src, origin)
     self_class = _erase(src) if erased else src
     return all(
         _solve_signature(
@@ -1332,6 +1335,20 @@ def _solve_value(dst, obj, solution: dict[_TypeParameter, tp.Any], /) -> bool:
         ok, bound = _solve_cached(
             dst, type(obj), frozenset(solution.items()), erased=True
         )
+        params, _ = _generic_bases(type(obj))
+        if (
+            ok
+            and params
+            and isinstance(obj, collections.abc.Collection)
+            and (args := _map_args(dst, collections.abc.Iterable, erased=False))
+        ):
+            # the items of a collection give the type arguments that were erased
+            [item] = args.values()
+            bound = frozenset(solution.items())
+            for t in set(map(type, obj)):
+                ok, bound = _solve_cached(item, t, bound, erased=True)
+                if not ok:
+                    return False
     if ok:
         solution.update(bound)
     return ok
@@ -1395,11 +1412,49 @@ def _infer_type(obj, /):
 class _generic_instancecheck(_checker):
     def __init__(self, typx: _SupportsGeneric, /):
         self.__form__ = typx
+        self.__args__ = _map_args(typx, collections.abc.Collection, erased=False)
 
     def __call__(self, obj, /, **ctx):
         if (src := _infer_type(obj)) is not None:
             return _assign_generic(self.__form__, src, **ctx)
-        return _assign_generic(self.__form__, type(obj), erased=True, **ctx)
+        if not _assign_generic(self.__form__, type(obj), erased=True, **ctx):
+            return False
+        params, _ = _generic_bases(type(obj))
+        if not (
+            self.__args__ is not None
+            and params
+            and isinstance(obj, collections.abc.Collection)
+        ):
+            return True
+        [item] = map(subtype, self.__args__.values())
+        ts = set(map(type, obj))
+        nested = {
+            t
+            for t in ts
+            if _issubclass(t, collections.abc.Collection) and _generic_bases(t)[0]
+        }
+        # the check of each nested item covers its type
+        if not all(_assign_type(item, _erase(t), **ctx) for t in ts - nested):
+            return False
+        recursion_count = ctx.setdefault("recursion_count", 0)
+        if (seen := ctx.get("seen")) is None:
+            seen = ctx["seen"] = set()
+        key = (id(obj), self.__form__)
+        # a cycle reaches the same pair again, which then holds
+        if not nested or recursion_count > _RECURSION_LIMIT or key in seen:
+            return True
+        seen.add(key)
+        try:
+            return all(
+                item.__subtype_instancecheck__(
+                    x,
+                    **(ctx | {"self_class": t, "recursion_count": recursion_count + 1}),
+                )
+                for x in obj
+                if (t := type(x)) in nested
+            )
+        finally:
+            seen.discard(key)
 
 
 class _generic_subclasscheck(_generic_instancecheck):

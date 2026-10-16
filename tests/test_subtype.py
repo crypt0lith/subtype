@@ -12,7 +12,7 @@ UserId = tp.NewType("UserId", int)
 AdminId = tp.NewType("AdminId", UserId)
 type IntOrStr = int | str
 type Pair[T] = T | tuple
-type Json = int | list[Json]
+type NestedInts = int | list[NestedInts]
 T = tp.TypeVar("T", bound=int)
 C = tp.TypeVar("C", int, str)
 U = tp.TypeVar("U")
@@ -85,7 +85,7 @@ def test_instancecheck(obj, dst, expected):
         (tp.Literal[1], UserId, False),
         (IntOrStr, int | str | bytes, True),
         (IntOrStr, int, False),
-        (Json, Json, True),
+        (NestedInts, NestedInts, True),
         (T, int, True),
         (T, str, False),
         (C, int | str, True),
