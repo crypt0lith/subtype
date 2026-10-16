@@ -24,14 +24,25 @@ class B:
         (bool, type[int], True),
         (str, type[int], False),
         (1, type[int], False),
-        (str, type[int | str], True),
-        (str, type[tp.Any], True),
-        (list, type[list[object]], True),
-        (list, type[list[int]], False),
         (int, tp.Type[int], True),
     ],
 )
-def test_instancecheck(obj, dst, expected):
+def test_instance_class(obj, dst, expected):
+    assert isinstance(obj, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "obj, dst, expected", [(str, type[int | str], True), (str, type[tp.Any], True)]
+)
+def test_instance_union_any(obj, dst, expected):
+    assert isinstance(obj, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "obj, dst, expected",
+    [(list, type[list[object]], True), (list, type[list[int]], False)],
+)
+def test_instance_generic(obj, dst, expected):
     assert isinstance(obj, subtype(dst)) is expected
 
 
@@ -41,19 +52,64 @@ def test_instancecheck(obj, dst, expected):
         (type[int], type[int], True),
         (type[bool], type[int], True),
         (type[int], type[bool], False),
+    ],
+)
+def test_subclass_type(src, dst, expected):
+    assert issubclass(src, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "src, dst, expected",
+    [
         (type[int | str], type[int], False),
         (type[int | str], type[int] | type[str], True),
         (type[int | str], type[int | str | bytes], True),
+    ],
+)
+def test_subclass_union(src, dst, expected):
+    assert issubclass(src, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "src, dst, expected",
+    [
         (type[T], type[int], True),
         (type[C], type[int], False),
         (type[C], type[int] | type[str], True),
+    ],
+)
+def test_subclass_typevar(src, dst, expected):
+    assert issubclass(src, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "src, dst, expected",
+    [
         (type, type[int], True),
         (abc.ABCMeta, type[object], True),
         (abc.ABCMeta, type[int], False),
+    ],
+)
+def test_subclass_metaclass(src, dst, expected):
+    assert issubclass(src, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "src, dst, expected",
+    [
         (int, type[int], False),
         (type[int], type, True),
         (type[int], object, True),
         (type[int], int, False),
+    ],
+)
+def test_subclass_nominal(src, dst, expected):
+    assert issubclass(src, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "src, dst, expected",
+    [
         (type[int], tp.Callable[[str], int], True),
         (type[int], tp.Callable[[], str], False),
         (type[A], tp.Callable[[int], A], True),
@@ -65,5 +121,5 @@ def test_instancecheck(obj, dst, expected):
         (type, tp.Callable[[int], str], True),
     ],
 )
-def test_subclasscheck(src, dst, expected):
+def test_subclass_callable(src, dst, expected):
     assert issubclass(src, subtype(dst)) is expected

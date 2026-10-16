@@ -43,30 +43,110 @@ type J3 = list[list[J3]]
         (list[bool], collections.abc.Iterable[int], True),
         (list[str], collections.abc.Iterable[int], False),
         (list[int], collections.abc.Iterable[float], True),
+        (tp.Sequence[int], tp.Iterable[int], True),
+        (frozenset[int], tp.AbstractSet[int], True),
+    ],
+)
+def test_subclass_covariant(src, dst, expected):
+    assert issubclass(src, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "src, dst, expected",
+    [
         (list[int], list[int], True),
         (list[bool], list[int], False),
         (list[int], list[bool], False),
         (list[int | str], list[str | int], True),
+    ],
+)
+def test_subclass_invariant(src, dst, expected):
+    assert issubclass(src, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "src, dst, expected",
+    [
         (list[tp.Any], list[int], True),
         (list[int], list[tp.Any], True),
+        (collections.abc.Sequence[tp.Any], collections.abc.Iterable[int], True),
+        (collections.abc.Sequence[...], collections.abc.Iterable[int], True),
+    ],
+)
+def test_subclass_any(src, dst, expected):
+    assert issubclass(src, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "src, dst, expected",
+    [
         (list, collections.abc.Iterable[int], False),
         (list, collections.abc.Iterable[object], True),
         (collections.abc.Sequence, collections.abc.Iterable[int], False),
-        (collections.abc.Sequence[tp.Any], collections.abc.Iterable[int], True),
-        (collections.abc.Sequence[...], collections.abc.Iterable[int], True),
-        (tp.Sequence[int], tp.Iterable[int], True),
+        (BareIterable, collections.abc.Iterable[int], False),
+        (BareIterable, collections.abc.Iterable[object], True),
+    ],
+)
+def test_subclass_bare(src, dst, expected):
+    assert issubclass(src, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "src, dst, expected",
+    [
+        (str, collections.abc.Sequence[str], True),
+        (str, collections.abc.Iterable[int], False),
+        (bytes, collections.abc.Sequence[int], True),
+        (int, collections.abc.Iterable[int], False),
+    ],
+)
+def test_subclass_non_generic(src, dst, expected):
+    assert issubclass(src, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "src, dst, expected",
+    [
         (A, collections.abc.Iterable[int], True),
         (A, collections.abc.Iterable[str], False),
-        (B, collections.abc.Iterable[int], True),
-        (B, collections.abc.Iterable[bool], False),
-        (B[bool], collections.abc.Iterable[int], True),
-        (G, collections.abc.Iterable[int], True),
-        (G, collections.abc.Iterable[bool], False),
         (IntList, collections.abc.Sequence[int], True),
         (IntList, collections.abc.Sequence[str], False),
         (IntList, list[int], True),
-        (BareIterable, collections.abc.Iterable[int], False),
-        (BareIterable, collections.abc.Iterable[object], True),
+    ],
+)
+def test_subclass_specialized_base(src, dst, expected):
+    assert issubclass(src, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "src, dst, expected",
+    [
+        (B, collections.abc.Iterable[int], True),
+        (B, collections.abc.Iterable[bool], False),
+        (G, collections.abc.Iterable[int], True),
+        (G, collections.abc.Iterable[bool], False),
+    ],
+)
+def test_subclass_unspecialized(src, dst, expected):
+    assert issubclass(src, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "src, dst, expected",
+    [
+        (B[bool], collections.abc.Iterable[int], True),
+        (Box[int], Box[int], True),
+        (Box[bool], Box[int], True),
+        (Box[int], Box[bool], False),
+    ],
+)
+def test_subclass_user_generic(src, dst, expected):
+    assert issubclass(src, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "src, dst, expected",
+    [
         (dict[str, int], collections.abc.Mapping[str, float], True),
         (dict[str, int], collections.abc.Mapping[bytes, int], False),
         (dict[bool, int], collections.abc.Mapping[int, int], False),
@@ -80,17 +160,45 @@ type J3 = list[list[J3]]
             collections.abc.Mapping[str, collections.abc.Sequence[int]],
             False,
         ),
-        (str, collections.abc.Sequence[str], True),
-        (str, collections.abc.Iterable[int], False),
-        (bytes, collections.abc.Sequence[int], True),
-        (frozenset[int], tp.AbstractSet[int], True),
+    ],
+)
+def test_subclass_mapping(src, dst, expected):
+    assert issubclass(src, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "src, dst, expected",
+    [
         (tp.Literal["ab"], collections.abc.Iterable[str], True),
         (tp.Literal[b"x"], collections.abc.Iterable[str], False),
+    ],
+)
+def test_subclass_literal(src, dst, expected):
+    assert issubclass(src, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "src, dst, expected",
+    [
         (
             tp.Literal["ab", b"x"],
             collections.abc.Iterable[str] | collections.abc.Iterable[int],
             True,
         ),
+        (
+            list[int],
+            collections.abc.Iterable[str] | collections.abc.Sequence[int],
+            True,
+        ),
+    ],
+)
+def test_subclass_union(src, dst, expected):
+    assert issubclass(src, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "src, dst, expected",
+    [
         (collections.abc.Generator[int], collections.abc.Iterator[int], True),
         (
             collections.abc.Generator[int, int, None],
@@ -107,17 +215,26 @@ type J3 = list[list[J3]]
             collections.abc.Generator[int, int, None],
             True,
         ),
-        (int, collections.abc.Iterable[int], False),
-        (
-            list[int],
-            collections.abc.Iterable[str] | collections.abc.Sequence[int],
-            True,
-        ),
+    ],
+)
+def test_subclass_generator(src, dst, expected):
+    assert issubclass(src, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "src, dst, expected",
+    [
         (Ints, collections.abc.Iterable[int], True),
         (Ints, collections.abc.Iterable[str], False),
-        (Box[int], Box[int], True),
-        (Box[bool], Box[int], True),
-        (Box[int], Box[bool], False),
+    ],
+)
+def test_subclass_alias(src, dst, expected):
+    assert issubclass(src, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "src, dst, expected",
+    [
         (list[NestedInts], NestedInts, True),
         (list[int], NestedInts, False),
         (J1, J2, True),
@@ -126,7 +243,7 @@ type J3 = list[list[J3]]
         (list[int], J1, False),
     ],
 )
-def test_subclasscheck(src, dst, expected):
+def test_subclass_recursive_alias(src, dst, expected):
     assert issubclass(src, subtype(dst)) is expected
 
 
@@ -136,33 +253,72 @@ def test_subclasscheck(src, dst, expected):
         ([1], list[int], True),
         ([1], collections.abc.Iterable[int], True),
         ((), collections.abc.Sequence[int], True),
+        (["a"], list[int], False),
+        ([True], collections.abc.Sequence[int], True),
+    ],
+)
+def test_instance_builtin(obj, dst, expected):
+    assert isinstance(obj, subtype(dst)) is expected
+
+
+def test_instance_generator():
+    assert isinstance((x for x in ()), subtype(collections.abc.Iterator[int]))
+
+
+@pytest.mark.parametrize(
+    "obj, dst, expected",
+    [
         ("ab", collections.abc.Iterable[int], False),
         ("ab", collections.abc.Sequence[str], True),
         (b"ab", collections.abc.Sequence[int], True),
+        ("ab", collections.abc.Sequence[collections.abc.Sequence[str]], True),
         (1, collections.abc.Iterable[int], False),
+    ],
+)
+def test_instance_non_generic(obj, dst, expected):
+    assert isinstance(obj, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "obj, dst, expected",
+    [
         ({}, collections.abc.Mapping[str, int], True),
+        ({1: 1}, collections.abc.Mapping[str, int], False),
+        ({"a": 1}, collections.abc.Mapping[str, int], True),
         ({}.keys(), collections.abc.KeysView[int], True),
         ({}.keys(), collections.abc.Sequence[int], False),
-        ((x for x in ()), collections.abc.Iterator[int], True),
+    ],
+)
+def test_instance_mapping(obj, dst, expected):
+    assert isinstance(obj, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "obj, dst, expected",
+    [
         (A(), collections.abc.Iterable[int], True),
         (A(), collections.abc.Iterable[str], False),
         (B(), collections.abc.Iterable[int], True),
         (Box[int](), Box[int], True),
         (Box[str](), Box[int], False),
         (Box(), Box[int], True),
+    ],
+)
+def test_instance_user_generic(obj, dst, expected):
+    assert isinstance(obj, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "obj, dst, expected",
+    [
         ([1, [2]], NestedInts, True),
         ([1, ["a"]], NestedInts, False),
         ([[1], [2, ["a"]]], NestedInts, False),
         ([["a"]], list[list[int] | list[bytes]], False),
         ("a", NestedInts, False),
-        (["a"], list[int], False),
-        ([True], collections.abc.Sequence[int], True),
-        ({1: 1}, collections.abc.Mapping[str, int], False),
-        ({"a": 1}, collections.abc.Mapping[str, int], True),
-        ("ab", collections.abc.Sequence[collections.abc.Sequence[str]], True),
     ],
 )
-def test_instancecheck(obj, dst, expected):
+def test_instance_nested(obj, dst, expected):
     assert isinstance(obj, subtype(dst)) is expected
 
 
