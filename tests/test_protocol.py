@@ -18,6 +18,29 @@ class IntGetter:
 class Nothing: ...
 
 
+class GetsInt(tp.Protocol):
+    def get(self, /) -> int: ...
+
+
+@tp.runtime_checkable
+class GetsIntChecked(tp.Protocol):
+    def get(self, /) -> int: ...
+
+
+@tp.runtime_checkable
+class Named(tp.Protocol):
+    name: str
+
+
+class StrGetter:
+    def get(self, /) -> str: ...
+
+
+class HasName:
+    def __init__(self):
+        self.name = ""
+
+
 class Counter[T]:
     def __iter__(self) -> tp.Self: ...
 
@@ -93,6 +116,36 @@ def test_subclass_iterator(src, dst, expected):
 )
 def test_instance_members(obj, dst, expected):
     assert isinstance(obj, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "obj, dst, expected",
+    [
+        (IntGetter(), GetsInt, True),
+        (StrGetter(), GetsInt, False),
+        (Nothing(), GetsInt, False),
+        (StrGetter(), GetsIntChecked, False),
+    ],
+)
+def test_instance_bare(obj, dst, expected):
+    assert isinstance(obj, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "src, dst, expected",
+    [
+        (IntGetter, GetsInt, True),
+        (StrGetter, GetsInt, False),
+        (StrGetter, GetsIntChecked, False),
+    ],
+)
+def test_subclass_bare(src, dst, expected):
+    assert issubclass(src, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize("obj, expected", [(HasName(), True), (Nothing(), False)])
+def test_instance_runtime_checkable(obj, expected):
+    assert isinstance(obj, subtype(Named)) is expected
 
 
 def test_instance_iterator():

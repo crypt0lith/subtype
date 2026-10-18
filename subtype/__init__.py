@@ -1192,6 +1192,18 @@ def _member_pairs(dst, src, /, *, erased=False) -> _MemberPairs | None:
     return tuple(pairs)
 
 
+def _probe(check: tp.Callable[[tp.Any, type], bool], obj, dst: type, /) -> bool:
+    """Return False if dst is a runtime-checkable protocol that obj does not
+    satisfy, which the runtime decides by member names alone.
+    """
+    if not _is_protocol(dst):
+        return True
+    try:
+        return check(obj, dst)
+    except TypeError:
+        return True
+
+
 @ft.lru_cache
 def _issubclass(src, dst: type, /) -> bool:
     try:
@@ -1231,6 +1243,8 @@ def _assign_protocol(
 def _assign_generic(
     dst: _SupportsGeneric, src, /, *, erased=False, **ctx: tp.Unpack[_AssignContext]
 ):
+    if not _probe(issubclass, tp.get_origin(src) or src, dst.__origin__):
+        return False
     src_args = _map_args(src, dst.__origin__, erased=erased)
     if (
         src_args is None
@@ -1344,7 +1358,9 @@ def _solve(
             _solve(a, src_args[p], solution, assuming=assuming)
             for p, a in dst_args.items()
         )
-    if not _is_protocol(origin):
+    if not _is_protocol(origin) or not _probe(
+        issubclass, tp.get_origin(src) or src, origin
+    ):
         return False
     if (pairs := _member_pairs(dst, src, erased=erased)) is None:
         return _issubclass(src, origin)
@@ -1463,6 +1479,8 @@ class _generic_instancecheck(_checker):
         self.__args__ = _map_args(typx, collections.abc.Collection, erased=False)
 
     def __call__(self, obj, /, **ctx):
+        if not _probe(isinstance, obj, self.__form__.__origin__):
+            return False
         if (src := _infer_type(obj)) is not None:
             return _assign_generic(self.__form__, src, **ctx)
         if not _assign_generic(self.__form__, type(obj), erased=True, **ctx):
@@ -1632,6 +1650,10 @@ class subtype(type):
             case builtins.tuple if hasattr(typx, "__args__"):
                 namespace[i_check] = _tuple_instancecheck(typx)
                 namespace[s_check] = _tuple_subclasscheck(typx)
+            case type() as origin if _is_protocol(origin) and not tp.get_args(typx):
+                alias = types.GenericAlias(origin, ())
+                namespace[i_check] = _generic_instancecheck(alias)
+                namespace[s_check] = _generic_subclasscheck(alias)
             case type() if not tp.get_args(typx):
                 namespace[i_check] = _nominal_instancecheck(typx)
                 namespace[s_check] = _nominal_subclasscheck(typx)
