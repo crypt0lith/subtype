@@ -3,7 +3,7 @@ requires = ["setuptools>=80", "setuptools-scm[simple]>=9.2"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "subtypes"
+name = "subtype"
 dynamic = ["version"]
 readme = "README.md"
 authors = [{ name = "crypt0lith" }]
@@ -13,13 +13,13 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["subtypes*"]
+include = ["subtype*"]
 
 [tool.black]
 preview = true
 skip-magic-trailing-comma = true
 target-version = ["py314"]
-extend-exclude = "^/subtypes/_stubs/"
+extend-exclude = "^/subtype/_stubs/"
 
 [tool.isort]
 profile = "black"

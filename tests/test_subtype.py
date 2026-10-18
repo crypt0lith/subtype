@@ -6,7 +6,7 @@ import typing as tp
 
 import pytest
 
-from subtypes import _subtypes, subtype
+from subtype import _subtypes, subtype
 
 UserId = tp.NewType("UserId", int)
 AdminId = tp.NewType("AdminId", UserId)

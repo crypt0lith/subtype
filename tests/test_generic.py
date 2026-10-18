@@ -3,7 +3,7 @@ import typing as tp
 
 import pytest
 
-from subtypes import subtype
+from subtype import subtype
 
 
 class A(collections.abc.Iterable[int]):

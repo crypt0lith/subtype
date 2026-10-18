@@ -3,7 +3,7 @@ import typing as tp
 
 import pytest
 
-from subtypes import subtype
+from subtype import subtype
 
 T = tp.TypeVar("T", bound=int)
 C = tp.TypeVar("C", int, str)
