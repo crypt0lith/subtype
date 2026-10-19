@@ -435,7 +435,7 @@ def _load_stubs():
         owner = tp.get_origin(owner) or owner
         return owner if isinstance(owner, type) else None
 
-    STUBS = files(__name__) / "_stubs"
+    STUBS = files(__name__) / "typeshed" / "stdlib"
     out = {}
     bases = {}
     with as_file(STUBS / "_typeshed" / "__init__.pyi") as path:

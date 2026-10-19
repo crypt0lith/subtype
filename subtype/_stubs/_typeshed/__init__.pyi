@@ -1,1 +1,0 @@
-../../../extern/typeshed/stdlib/_typeshed/__init__.pyi

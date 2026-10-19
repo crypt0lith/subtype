@@ -1,1 +1,0 @@
-../../extern/typeshed/stdlib/_collections_abc.pyi
