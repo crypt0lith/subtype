@@ -1499,7 +1499,6 @@ def _infer_type(obj, /):
 class _generic_instancecheck(_checker):
     def __init__(self, typx: _SupportsGeneric, /):
         self.__form__ = typx
-        self.__args__ = _map_args(typx, collections.abc.Collection, erased=False)
         self.call = (
             _callable_instancecheck(typx)
             if "__call__" in _protocol_members(typx.__origin__)
@@ -1517,14 +1516,56 @@ class _generic_instancecheck(_checker):
             return _assign_generic(self.__form__, src, **ctx)
         if not _assign_generic(self.__form__, type(obj), erased=True, **ctx):
             return False
-        params, _ = _generic_bases(type(obj))
-        if not (
-            self.__args__ is not None
-            and params
-            and isinstance(obj, collections.abc.Collection)
+        getitem = _specialize_member(self.__form__, "__getitem__") or ()
+        if getitem and callable(getattr(obj, "keys", None)):
+            kts = [
+                a
+                for s in _specialize_member(self.__form__, "keys") or ()
+                for a in (
+                    _map_args(
+                        s.return_annotation, collections.abc.Iterable, erased=False
+                    )
+                    or {}
+                ).values()
+            ]
+            kt = tp.Union[*kts] if kts else object
+            vt = tp.Union[
+                *(
+                    (
+                        tp.Any
+                        if s.return_annotation is inspect.Signature.empty
+                        else s.return_annotation
+                    )
+                    for s in getitem
+                )
+            ]
+            d = obj if isinstance(obj, collections.abc.Mapping) else {**obj}
+            return all(
+                subtype(collections.abc.Collection[t]).__subtype_instancecheck__(
+                    xs, **ctx
+                )
+                for t, xs in zip((kt, vt), (d.keys(), d.values()))
+            )
+        if rets := [
+            (
+                tp.Any
+                if s.return_annotation is inspect.Signature.empty
+                else s.return_annotation
+            )
+            for s in getitem
+            if (p := next(iter(s.parameters.values()), None)) is not None
+            and (
+                p.annotation is inspect.Parameter.empty
+                or _assign_type(subtype(p.annotation), int)
+            )
+        ]:
+            item = subtype(tp.Union[*rets])
+        elif isinstance(obj, collections.abc.Collection) and (
+            args := _map_args(self.__form__, collections.abc.Iterable, erased=False)
         ):
+            [item] = map(subtype, args.values())
+        else:
             return True
-        [item] = map(subtype, self.__args__.values())
         ts = set(map(type, obj))
         nested = {
             t

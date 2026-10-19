@@ -29,8 +29,51 @@ class Box[T]:
     def __init__(self, item=None): ...
 
 
+class SupportsKeysAndGetItem[K, V](tp.Protocol):
+    def keys(self) -> collections.abc.Iterable[K]: ...
+    def __getitem__(self, key: K, /) -> V: ...
+
+
+class KeysAndGetItem:
+    def keys(self):
+        return set("ab")
+
+    def __getitem__(self, key, /):
+        return 42
+
+
+class SupportsLenAndGetItem[T](tp.Protocol):
+    def __len__(self) -> int: ...
+    def __getitem__(self, k: int, /) -> T: ...
+
+
+class LenAndGetItem:
+    def __len__(self):
+        return 2
+
+    def __getitem__(self, index, /):
+        if index >= len(self):
+            raise IndexError
+        return index
+
+
+class SupportsGetItem[T](tp.Protocol):
+    def __getitem__(self, k: int, /) -> T: ...
+
+
+class GetItem:
+    def __getitem__(self, index, /):
+        if index >= 2:
+            raise IndexError
+        return index
+
+
+class UnparameterizedList(list): ...
+
+
 type Ints = list[int]
 type NestedInts = int | list[NestedInts]
+type NestedDict = int | dict[str, NestedDict]
 type J1 = list[J1]
 type J2 = list[J2]
 type J3 = list[list[J3]]
@@ -254,6 +297,14 @@ def test_subclass_recursive_alias(src, dst, expected):
         ((), collections.abc.Sequence[int], True),
         (["a"], list[int], False),
         ([True], collections.abc.Sequence[int], True),
+        (["a"], collections.abc.Iterable[int], False),
+        (["a"], collections.abc.Reversible[int], False),
+        (UnparameterizedList(["a"]), list[int], False),
+        (LenAndGetItem(), SupportsLenAndGetItem[int], True),
+        (LenAndGetItem(), SupportsLenAndGetItem[str], False),
+        ([1], SupportsLenAndGetItem[str], False),
+        (GetItem(), SupportsGetItem[int], True),
+        (GetItem(), SupportsGetItem[str], False),
     ],
 )
 def test_instance_builtin(obj, dst, expected):
@@ -284,6 +335,14 @@ def test_instance_non_generic(obj, dst, expected):
         ({}, collections.abc.Mapping[str, int], True),
         ({1: 1}, collections.abc.Mapping[str, int], False),
         ({"a": 1}, collections.abc.Mapping[str, int], True),
+        ({"a": "b"}, collections.abc.Mapping[str, int], False),
+        ({"a": ["b"]}, dict[str, list[int]], False),
+        ({"a": "b"}, collections.abc.Collection[str], True),
+        (KeysAndGetItem(), SupportsKeysAndGetItem[str, int], True),
+        (KeysAndGetItem(), SupportsKeysAndGetItem[str, str], False),
+        (KeysAndGetItem(), SupportsKeysAndGetItem[int, int], False),
+        ({"a": "b"}, SupportsKeysAndGetItem[str, int], False),
+        (collections.defaultdict(int, a="b"), dict[str, int], False),
         ({}.keys(), collections.abc.KeysView[int], True),
         ({}.keys(), collections.abc.Sequence[int], False),
     ],
@@ -334,3 +393,9 @@ def cycle(request):
 )
 def test_cycle(cycle, dst, expected):
     assert isinstance(cycle, subtype(dst)) is expected
+
+
+def test_cycle_mapping():
+    d = {}
+    d["a"] = d
+    assert isinstance(d, subtype(NestedDict))
