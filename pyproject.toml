@@ -12,6 +12,11 @@ dependencies = [
     "typing-extensions>=4.15",
 ]
 
+[dependency-groups]
+tests = [
+    "pytest>=9.1.1",
+]
+
 [tool.setuptools.packages.find]
 include = ["subtype*"]
 
@@ -26,8 +31,3 @@ profile = "black"
 split_on_trailing_comma = false
 combine_as_imports = true
 skip_gitignore = true
-
-[dependency-groups]
-tests = [
-    "pytest>=9.1.1",
-]
