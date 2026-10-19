@@ -75,6 +75,10 @@ class Forward[**P](tp.Protocol):
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> int: ...
 
 
+class Call[T](tp.Protocol):
+    def __call__(self, x: int, /) -> T: ...
+
+
 P = tp.ParamSpec("P")
 
 
@@ -214,6 +218,21 @@ def test_instance_object(obj, dst, expected):
 
 
 @pytest.mark.parametrize(
+    "obj, dst, expected",
+    [
+        (f, Call[str], True),
+        (f, Call[bytes], False),
+        (A, Call[A], True),
+        (A, Call[str], False),
+        (ov, OverloadCall, True),
+        (f, OverloadCall, False),
+    ],
+)
+def test_instance_call_protocol(obj, dst, expected):
+    assert isinstance(obj, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
     "src, dst, expected",
     [
         (tp.Callable[[int], str], tp.Callable[[int], str], True),
@@ -315,6 +334,19 @@ def test_subclass_paramspec(src, dst, expected):
     ],
 )
 def test_subclass_not_callable(src, dst, expected):
+    assert issubclass(src, subtype(dst)) is expected
+
+
+@pytest.mark.parametrize(
+    "src, dst, expected",
+    [
+        (tp.Callable[[int], str], Call[str], True),
+        (tp.Callable[[int], str], Call[bytes], False),
+        (type[A], Call[A], True),
+        (type[A], Call[str], False),
+    ],
+)
+def test_subclass_call_protocol(src, dst, expected):
     assert issubclass(src, subtype(dst)) is expected
 
 

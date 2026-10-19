@@ -1121,9 +1121,55 @@ def _assign_signature(
     )
 
 
+def _specialize_member(
+    typx, name: str, /, *, erased=False
+) -> tuple[inspect.Signature, ...] | None:
+    """Return the signatures of the method name of typx, with the type
+    arguments of typx substituted, or None if no class in its MRO declares it.
+    """
+    if (member := _member_signatures(tp.get_origin(typx) or typx, name)) is None:
+        return
+    owner, sigs = member
+    subst = _map_args(typx, owner, erased=erased) or {}
+    return tuple(_substitute_signature(s, subst) for s in sigs)
+
+
+def _type_call_signatures(typx, /) -> tuple[inspect.Signature, ...] | None:
+    """Return the signatures of calling a value of typx, or None if a value of
+    typx is not callable.
+    """
+    origin = tp.get_origin(typx) or typx
+    if origin is collections.abc.Callable and tp.get_args(typx):
+        return (_callable_signature(typx),)
+    if origin is builtins.type and tp.get_args(typx):
+        # a value of type[X] calls the constructor of X
+        [arg] = tp.get_args(typx)
+        return _get_overloads(tp.get_origin(arg) or arg)
+    if not (isinstance(origin, type) and issubclass(origin, collections.abc.Callable)):
+        return
+    if not tp.get_args(typx) and (params := _generic_bases(origin)[0]):
+        typx = types.GenericAlias(
+            origin, tuple(p.__default__ if p.has_default() else p for p in params)
+        )
+    if (sigs := _specialize_member(typx, "__call__")) is not None:
+        return sigs
+    call = inspect.getattr_static(origin, "__call__")
+    ovs, _ = _resolve_call(call)
+    return _get_signatures(*(ovs or (call,)), is_bound=True)
+
+
+def _self_class(src, /, *, erased=False):
+    """Return the type that Self binds to in the members of src."""
+    if (tp.get_origin(src) or src) is builtins.type and tp.get_args(src):
+        # a value of type[X] is the class X
+        [arg] = tp.get_args(src)
+        return arg
+    return _erase(src) if erased else src
+
+
 class _callable_instancecheck(_checker):
     def __init__(self, typx: _SupportsGeneric, /):
-        self.signature = _callable_signature(typx)
+        self.signatures = _type_call_signatures(typx) or ()
 
     def __call__(self, obj, /, **ctx):
         if not callable(obj):
@@ -1131,37 +1177,20 @@ class _callable_instancecheck(_checker):
         # bind Self to the self class of the callable
         owner = getattr(obj, "__self__", obj)
         ctx["self_class"] = owner if isinstance(owner, type) else type(owner)
-        return any(
-            _assign_signature(self.signature, sig, **ctx) for sig in _get_overloads(obj)
+        sigs = _get_overloads(obj)
+        return all(
+            any(_assign_signature(d, s, **ctx) for s in sigs) for d in self.signatures
         )
 
 
 class _callable_subclasscheck(_callable_instancecheck):
     def __call__(self, obj, /, **ctx):
-        origin = tp.get_origin(obj) or obj
-        if origin is collections.abc.Callable and tp.get_args(obj):
-            sigs = (_callable_signature(obj),)
-        elif origin is builtins.type and tp.get_args(obj):
-            # a value of type[X] calls the constructor of X
-            [ctx["self_class"]] = tp.get_args(obj)
-            sigs = _get_overloads(tp.get_origin(ctx["self_class"]) or ctx["self_class"])
-        elif isinstance(origin, type) and issubclass(origin, collections.abc.Callable):
-            if (member := _member_signatures(origin, "__call__")) is not None:
-                owner, sigs = member
-                if not tp.get_args(obj) and (params := _generic_bases(origin)[0]):
-                    obj = types.GenericAlias(
-                        origin,
-                        tuple(p.__default__ if p.has_default() else p for p in params),
-                    )
-                subst = _map_args(obj, owner, erased=False) or {}
-                sigs = tuple(_substitute_signature(s, subst) for s in sigs)
-            else:
-                call = inspect.getattr_static(origin, "__call__")
-                ovs, _ = _resolve_call(call)
-                sigs = _get_signatures(*(ovs or (call,)), is_bound=True)
-        else:
+        if (sigs := _type_call_signatures(obj)) is None:
             return False
-        return any(_assign_signature(self.signature, sig, **ctx) for sig in sigs)
+        ctx["self_class"] = _self_class(obj)
+        return all(
+            any(_assign_signature(d, s, **ctx) for s in sigs) for d in self.signatures
+        )
 
 
 @ft.lru_cache
@@ -1173,21 +1202,15 @@ def _member_pairs(dst, src, /, *, erased=False) -> _MemberPairs | None:
     origin = tp.get_origin(src) or src
     pairs = []
     for name in _protocol_members(tp.get_origin(dst)):
-        dst_member = _member_signatures(tp.get_origin(dst), name)
-        if not isinstance(origin, type) or dst_member is None:
+        dst_sigs = _specialize_member(dst, name)
+        if name == "__call__":
+            # Callable[...] and type[X] are called through their signature
+            # and constructor, not through a __call__ member
+            src_sigs = _type_call_signatures(_erase(src) if erased else src)
+        else:
+            src_sigs = _specialize_member(src, name, erased=erased)
+        if not isinstance(origin, type) or dst_sigs is None or src_sigs is None:
             return
-        if (src_member := _member_signatures(origin, name)) is None:
-            return
-        dst_sigs, src_sigs = (
-            tuple(
-                _substitute_signature(s, _map_args(x, owner, erased=e) or {})
-                for s in sigs
-            )
-            for x, (owner, sigs), e in (
-                (dst, dst_member, False),
-                (src, src_member, erased),
-            )
-        )
         pairs.append((dst_sigs, src_sigs))
     return tuple(pairs)
 
@@ -1232,7 +1255,7 @@ def _assign_protocol(
     if (item := (subtype(dst), src)) in ctx["assuming"]:
         return True
     ctx["assuming"] |= {item}
-    ctx["self_class"] = _erase(src) if erased else src
+    ctx["self_class"] = _self_class(src, erased=erased)
     return all(
         any(_assign_signature(d, s, **ctx) for s in src_sigs)
         for dst_sigs, src_sigs in pairs
@@ -1364,7 +1387,7 @@ def _solve(
         return False
     if (pairs := _member_pairs(dst, src, erased=erased)) is None:
         return _issubclass(src, origin)
-    self_class = _erase(src) if erased else src
+    self_class = _self_class(src, erased=erased)
     return all(
         _solve_signature(
             d, src_sigs, solution, self_class=self_class, assuming=assuming
@@ -1477,9 +1500,18 @@ class _generic_instancecheck(_checker):
     def __init__(self, typx: _SupportsGeneric, /):
         self.__form__ = typx
         self.__args__ = _map_args(typx, collections.abc.Collection, erased=False)
+        self.call = (
+            _callable_instancecheck(typx)
+            if "__call__" in _protocol_members(typx.__origin__)
+            else None
+        )
 
     def __call__(self, obj, /, **ctx):
         if not _probe(isinstance, obj, self.__form__.__origin__):
+            return False
+        # _assign_generic only sees type(obj), whose __call__ is type.__call__
+        # for a class and FunctionType.__call__ for a function
+        if not (self.call is None or self.call(obj, **ctx)):
             return False
         if (src := _infer_type(obj)) is not None:
             return _assign_generic(self.__form__, src, **ctx)
