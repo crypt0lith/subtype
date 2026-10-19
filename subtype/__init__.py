@@ -1,4 +1,4 @@
-__all__ = ["subtype"]
+__all__ = ["isinstance", "subtype"]
 import abc
 import annotationlib
 import ast
@@ -11,6 +11,7 @@ import sys
 import types
 import typing as tp
 import weakref
+from builtins import isinstance as isinstance_
 
 _RECURSION_LIMIT = 16
 _TypeParameter: tp.TypeAlias = tp.TypeVar | tp.TypeVarTuple | tp.ParamSpec
@@ -57,7 +58,7 @@ def _tuple_entries(typx: type[tuple], /) -> list[tuple[tp.Any, bool]] | None:
     entries = []
     for arg in tp.get_args(typx):
         for x in _unpack_tuple_items(arg):
-            if isinstance(x, tp.TypeVarTuple):
+            if isinstance_(x, tp.TypeVarTuple):
                 return
             if _is_unpacked(x) and _is_indeterminate_tuple(x):
                 entries.append((tp.get_args(x)[0], True))
@@ -138,7 +139,7 @@ def _make_typevars_bound(
     if args := tp.get_args(typx):
         type_params = _get_dst_params(typx) | type_params
         origin = tp.get_origin(typx) or typx
-        if isinstance(origin, tp.TypeAliasType):
+        if isinstance_(origin, tp.TypeAliasType):
             typx = _make_typevars_bound(
                 _get_value_or_forwardref(origin.evaluate_value),
                 type_params,
@@ -155,7 +156,11 @@ def _make_typevars_bound(
         new_args = []
         for arg in args:
             new_arg = _make_typevars_bound(
-                (type_params.get(arg, arg) if isinstance(arg, _TypeParameter) else arg),
+                (
+                    type_params.get(arg, arg)
+                    if isinstance_(arg, _TypeParameter)
+                    else arg
+                ),
                 type_params,
                 recursion_count + 1,
             )
@@ -183,7 +188,7 @@ class _ForwardRefSubscriptTransformer(ast.NodeTransformer):
         # types like slice, zip, and dict_items are subscriptable in
         # annotations, but do not define __class_getitem__ at runtime.
         if (
-            isinstance(node.value, ast.Name)
+            isinstance_(node.value, ast.Name)
             and node.value.id in self._ns
             and not hasattr(self._ns[node.value.id], "__class_getitem__")
         ):
@@ -206,7 +211,7 @@ class _ForwardRefSubscriptTransformer(ast.NodeTransformer):
             locals = {}
         else:
             locals = dict(locals)
-        if isinstance(forwardref.__cell__, dict):
+        if isinstance_(forwardref.__cell__, dict):
             for cell_name, cell in forwardref.__cell__.items():
                 try:
                     cell_value = cell.cell_contents
@@ -227,7 +232,7 @@ class _ForwardRefSubscriptTransformer(ast.NodeTransformer):
 
 
 def _evaluate(typx: tp.TypeAliasType | tp.ForwardRef, /):
-    if isinstance(typx, tp.ForwardRef):
+    if isinstance_(typx, tp.ForwardRef):
         return _ForwardRefSubscriptTransformer.evaluate_forwardref(typx)
     if tp.get_args(typx):
         return _make_typevars_bound(typx)
@@ -285,12 +290,12 @@ def _load_stubs():
         def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.stmt:
             # check if this is a self-referential TypeAlias
             if (
-                isinstance(node.target, ast.Name)
-                and isinstance(node.annotation, ast.Name)
+                isinstance_(node.target, ast.Name)
+                and isinstance_(node.annotation, ast.Name)
                 and node.annotation.id == "TypeAlias"
                 and node.value is not None
                 and any(
-                    isinstance(n, ast.Name) and n.id == node.target.id
+                    isinstance_(n, ast.Name) and n.id == node.target.id
                     for n in ast.walk(node.value)
                 )
             ):
@@ -348,11 +353,11 @@ def _load_stubs():
         def _body(self, body: list[ast.stmt], depth: int = 0) -> list[ast.stmt]:
             out: list[ast.stmt] = []
             for s in body:
-                if isinstance(s, ast.If):
+                if isinstance_(s, ast.If):
                     s.body = self._body(s.body, depth)
                     s.orelse = self._body(s.orelse, depth) if s.orelse else []
                     out.append(s)
-                elif isinstance(s, ast.ClassDef):
+                elif isinstance_(s, ast.ClassDef):
                     if s.name in self._runtime:
                         bases = s.bases
                         s.bases, s.keywords, s.decorator_list = [], [], []
@@ -375,22 +380,22 @@ def _load_stubs():
                             d
                             for d in s.decorator_list
                             if not (
-                                isinstance(d, ast.Name) and d.id == "type_check_only"
+                                isinstance_(d, ast.Name) and d.id == "type_check_only"
                             )
                         ]
                         out.append(s)
-                elif isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                elif isinstance_(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     if depth or s.name in self._runtime:
                         is_prop = False
                         for d in s.decorator_list:
-                            if isinstance(d, ast.Name) and d.id in {
+                            if isinstance_(d, ast.Name) and d.id in {
                                 "property",
                                 "overload",
                             }:
                                 is_prop = d.id == "property"
                                 break
                             if (
-                                isinstance(d, ast.Attribute)
+                                isinstance_(d, ast.Attribute)
                                 and getattr(d.value, "id", None) == s.name
                             ):
                                 is_prop = True
@@ -433,7 +438,7 @@ def _load_stubs():
     def runtime_class(module, name):
         owner = vars(module).get(name)
         owner = tp.get_origin(owner) or owner
-        return owner if isinstance(owner, type) else None
+        return owner if isinstance_(owner, type) else None
 
     STUBS = files(__name__) / "typeshed" / "stdlib"
     out = {}
@@ -498,7 +503,7 @@ def _stub_functions() -> (
         for name, ovs in members.items():
             attr = vars(owner).get(name)
             # unwrap __func__ from a classmethod or staticmethod
-            if isinstance(func := getattr(attr, "__func__", attr), types.FunctionType):
+            if isinstance_(func := getattr(attr, "__func__", attr), types.FunctionType):
                 out[func] = ovs
     return types.MappingProxyType(out)
 
@@ -519,7 +524,7 @@ def _resolve_call(obj, /) -> tuple[tp.Sequence[tp.Callable], bool]:
                 decls = [
                     (
                         _get_member_overloads(typx, name)
-                        if isinstance(getattr(a, "__func__", a), types.FunctionType)
+                        if isinstance_(getattr(a, "__func__", a), types.FunctionType)
                         else ()
                     )
                     for name, a in attrs
@@ -529,7 +534,7 @@ def _resolve_call(obj, /) -> tuple[tp.Sequence[tp.Callable], bool]:
         return ()
 
     objtype = type(obj)
-    if isinstance(obj, types.FunctionType) or hasattr(objtype, "__func__"):
+    if isinstance_(obj, types.FunctionType) or hasattr(objtype, "__func__"):
         ovs = tp.get_overloads(obj) or _stub_functions().get(
             getattr(obj, "__func__", obj), ()
         )
@@ -544,7 +549,7 @@ def _resolve_call(obj, /) -> tuple[tp.Sequence[tp.Callable], bool]:
                 return members.get(name, ()), False
             case _, (m_self, name):
                 # getattr(m_self, name) => unbound method
-                if isinstance(m_self, type):
+                if isinstance_(m_self, type):
                     # include the metaclass in attribute lookup
                     mro = (*m_self.__mro__, *type(m_self).__mro__)
                 else:
@@ -562,10 +567,10 @@ def _resolve_call(obj, /) -> tuple[tp.Sequence[tp.Callable], bool]:
         # the constructor type.__call__ delegates to
         return lookup(obj.__mro__, "__new__", "__init__"), True
     # binding loses the owner that overload-only declarations are keyed by
-    if isinstance(getattr(call, "__func__", call), types.FunctionType) and (
+    if isinstance_(getattr(call, "__func__", call), types.FunctionType) and (
         ovs := _get_member_overloads(owner, "__call__")
     ):
-        return ovs, not isinstance(ovs[0], staticmethod)
+        return ovs, not isinstance_(ovs[0], staticmethod)
     if hasattr(type(call), "__get__"):
         call = call.__get__(obj, objtype)
     return _resolve_call(call)
@@ -591,13 +596,13 @@ def _get_overloads(obj: tp.Callable, /) -> tuple[inspect.Signature, ...]:
     ovs, is_bound = _resolve_call(obj)
     if ovs:
         sigs = _get_signatures(*ovs, is_bound=is_bound)
-    elif isinstance(obj, (type, types.FunctionType)):
+    elif isinstance_(obj, (type, types.FunctionType)):
         sigs = _get_signatures(obj)
     else:
         sigs = (
             inspect.signature(obj, annotation_format=annotationlib.Format.FORWARDREF),
         )
-    if isinstance(obj, type):
+    if isinstance_(obj, type):
         # an unannotated or __init__ signature returns Self
         return tuple(
             (
@@ -667,7 +672,7 @@ def _type_args(
         args = (tp.Union[*(t for t, _ in entries)] if entries else tp.Never,)
     subst: dict[tp.TypeVar, tp.Any] = {}
     for i, param in enumerate(params):
-        if not isinstance(param, tp.TypeVar):
+        if not isinstance_(param, tp.TypeVar):
             return
         arg = args[i] if i < len(args) else _default_arg(param, erased=erased)
         subst[param] = tp.Any if arg is ... else arg
@@ -675,7 +680,7 @@ def _type_args(
 
 
 def _substitute(typx, subst: tp.Mapping, /):
-    if isinstance(typx, tp.TypeVar):
+    if isinstance_(typx, tp.TypeVar):
         return subst.get(typx, typx)
     if tp.get_origin(typx) and (params := getattr(typx, "__parameters__", ())):
         return typx[*(subst.get(p, p) for p in params)]
@@ -693,7 +698,7 @@ def _substitute_signature(sig: inspect.Signature, subst: tp.Mapping, /):
 
 
 def _free_params(typx, /) -> tuple[_TypeParameter, ...]:
-    if isinstance(typx, _TypeParameter):
+    if isinstance_(typx, _TypeParameter):
         return (typx,)
     if tp.get_origin(typx):
         return getattr(typx, "__parameters__", ())
@@ -711,7 +716,7 @@ def _specialize(src, dst: type, /, *, erased: bool):
         origin = tp.get_origin(typx) or typx
         if origin is dst:
             return _substitute(typx, subst)
-        if not (isinstance(origin, type) and (is_protocol or issubclass(origin, dst))):
+        if not (isinstance_(origin, type) and (is_protocol or issubclass(origin, dst))):
             continue
         params, bases = _generic_bases(origin)
         if (args := _type_args(typx, params, erased=erased)) is None:
@@ -762,9 +767,9 @@ def _member_signatures(
                 return owner, _get_signatures(*members[name], is_bound=True)
             continue
         attr = vars(owner).get(name)
-        if isinstance(getattr(attr, "__func__", attr), types.FunctionType):
+        if isinstance_(getattr(attr, "__func__", attr), types.FunctionType):
             ovs = _get_member_overloads(owner, name) or (attr,)
-            is_bound = not isinstance(ovs[0], staticmethod)
+            is_bound = not isinstance_(ovs[0], staticmethod)
             return owner, _get_signatures(*ovs, is_bound=is_bound)
 
 
@@ -780,7 +785,7 @@ def _protocol_members(typx: type, /) -> set[str]:
             names |= {
                 name
                 for name in base.__protocol_attrs__
-                if isinstance(
+                if isinstance_(
                     getattr(attr := vars(base).get(name), "__func__", attr),
                     types.FunctionType,
                 )
@@ -826,7 +831,7 @@ def _assign_type(dst: subtype, src, /, **ctx: tp.Unpack[_AssignContext]) -> bool
             [arg] = tp.get_args(src)
             if tp.get_origin(arg) is tp.Union:
                 return all(_assign_type(dst, type[a], **ctx) for a in arg.__args__)
-            if isinstance(arg, tp.TypeVar):
+            if isinstance_(arg, tp.TypeVar):
                 if arg.__constraints__:
                     return all(
                         _assign_type(dst, type[c], **ctx) for c in arg.__constraints__
@@ -868,19 +873,19 @@ def _declared_types(typx: type, /) -> list[tuple[tp.Any, _AssignFlag]]:
     for name, attr in vars(typx).items():
         if name in ("__new__", "__init__"):
             continue
-        if isinstance(attr, property):
+        if isinstance_(attr, property):
             funcs = (attr.fget, attr.fset, attr.fdel)
         else:
             funcs = (attr,)
         for func in funcs:
             func = getattr(func, "__func__", func)
-            if not isinstance(func, types.FunctionType):
+            if not isinstance_(func, types.FunctionType):
                 continue
-            if isinstance(attr, property):
+            if isinstance_(attr, property):
                 ovs = tp.get_overloads(func) or (func,)
             else:
                 ovs = _get_member_overloads(typx, name) or (attr,)
-            is_bound = not isinstance(ovs[0], staticmethod)
+            is_bound = not isinstance_(ovs[0], staticmethod)
             for sig in _get_signatures(*ovs, is_bound=is_bound):
                 out += [
                     (p.annotation, _AssignFlag.CONTRAVARIANT)
@@ -920,7 +925,7 @@ def _infer_variance(
     params, _ = _generic_bases(typx)
     out = {}
     for i, param in enumerate(params):
-        if not (isinstance(param, tp.TypeVar) and param.__infer_variance__):
+        if not (isinstance_(param, tp.TypeVar) and param.__infer_variance__):
             continue
         bounds: list[type[tp.Any]] = [object, types.new_class(param.__name__)]
         bound_args = [[_VarianceDummy] * len(params) for _ in range(len(bounds))]
@@ -980,7 +985,7 @@ class _nominal_instancecheck(_checker):
         self.__args__ = (typx,)
 
     def __call__(self, obj, /, **__):
-        return isinstance(obj, self.__args__)
+        return isinstance_(obj, self.__args__)
 
 
 class _nominal_subclasscheck(_nominal_instancecheck):
@@ -992,7 +997,7 @@ class _nominal_subclasscheck(_nominal_instancecheck):
 
 def _assign_tuple(dst, src, /, **ctx: tp.Unpack[_AssignContext]) -> bool:
     origin = tp.get_origin(src) or src
-    if not (isinstance(origin, type) and issubclass(origin, builtins.tuple)):
+    if not (isinstance_(origin, type) and issubclass(origin, builtins.tuple)):
         return False
     base = _specialize(src, builtins.tuple, erased=False)
     if (
@@ -1014,7 +1019,7 @@ class _tuple_instancecheck(_checker):
         self.__form__ = typx
 
     def __call__(self, obj, /, **ctx):
-        if not isinstance(obj, builtins.tuple):
+        if not isinstance_(obj, builtins.tuple):
             return False
         if (entries := _tuple_entries(self.__form__)) is None:
             return True
@@ -1039,7 +1044,7 @@ def _callable_signature(typx: _SupportsGeneric, /) -> inspect.Signature:
     params, ret = tp.get_args(typx)
     if tp.get_origin(params) is tp.Concatenate:
         *params, tail = tp.get_args(params)
-    elif isinstance(params, list):
+    elif isinstance_(params, list):
         tail = None
     else:
         params, tail = [], params
@@ -1052,7 +1057,7 @@ def _callable_signature(typx: _SupportsGeneric, /) -> inspect.Signature:
             inspect.Parameter("args", inspect.Parameter.VAR_POSITIONAL),
             inspect.Parameter("kwargs", inspect.Parameter.VAR_KEYWORD),
         ]
-    elif isinstance(tail, tp.ParamSpec):
+    elif isinstance_(tail, tp.ParamSpec):
         sig += [
             inspect.Parameter(
                 "args", inspect.Parameter.VAR_POSITIONAL, annotation=tail.args
@@ -1111,7 +1116,7 @@ def _assign_signature(
     if not all(
         _assign_type(subtype(p), t, **ctx)
         for p, t in solution.items()
-        if isinstance(p, tp.TypeVar)
+        if isinstance_(p, tp.TypeVar)
     ):
         return False
     return _assign_with_variance(
@@ -1145,7 +1150,7 @@ def _type_call_signatures(typx, /) -> tuple[inspect.Signature, ...] | None:
         # a value of type[X] calls the constructor of X
         [arg] = tp.get_args(typx)
         return _get_overloads(tp.get_origin(arg) or arg)
-    if not (isinstance(origin, type) and issubclass(origin, collections.abc.Callable)):
+    if not (isinstance_(origin, type) and issubclass(origin, collections.abc.Callable)):
         return
     if not tp.get_args(typx) and (params := _generic_bases(origin)[0]):
         typx = types.GenericAlias(
@@ -1176,7 +1181,7 @@ class _callable_instancecheck(_checker):
             return False
         # bind Self to the self class of the callable
         owner = getattr(obj, "__self__", obj)
-        ctx["self_class"] = owner if isinstance(owner, type) else type(owner)
+        ctx["self_class"] = owner if isinstance_(owner, type) else type(owner)
         sigs = _get_overloads(obj)
         return all(
             any(_assign_signature(d, s, **ctx) for s in sigs) for d in self.signatures
@@ -1209,7 +1214,7 @@ def _member_pairs(dst, src, /, *, erased=False) -> _MemberPairs | None:
             src_sigs = _type_call_signatures(_erase(src) if erased else src)
         else:
             src_sigs = _specialize_member(src, name, erased=erased)
-        if not isinstance(origin, type) or dst_sigs is None or src_sigs is None:
+        if not isinstance_(origin, type) or dst_sigs is None or src_sigs is None:
             return
         pairs.append((dst_sigs, src_sigs))
     return tuple(pairs)
@@ -1328,7 +1333,7 @@ def _solve(
     """Bind the type parameters in dst to the types src passes to them, and
     return whether src is assignable to dst.
     """
-    if isinstance(dst, tp.TypeVar):
+    if isinstance_(dst, tp.TypeVar):
         solution[dst] = tp.Union[solution[dst], src] if dst in solution else src
         return True
     if not (params := _free_params(dst)):
@@ -1343,7 +1348,7 @@ def _solve(
         # a bare TypeVar accepts any member of src, so it is tried last
         free = sorted(
             (a for a in dst.__args__ if _free_params(a)),
-            key=lambda a: isinstance(a, tp.TypeVar),
+            key=lambda a: isinstance_(a, tp.TypeVar),
         )
         for s in src.__args__ if tp.get_origin(src) is tp.Union else (src,):
             if any(_assign_type(subtype(f), s) for f in fixed):
@@ -1365,7 +1370,7 @@ def _solve(
         return True
     if tp.get_origin(src) is tp.Union:
         return all(_solve(dst, s, solution, assuming=assuming) for s in src.__args__)
-    if not isinstance(origin, type):
+    if not isinstance_(origin, type):
         return False
     # a self-referential member is its own cyclic lower bound.
     if (dst, src) in assuming:
@@ -1402,7 +1407,7 @@ def _solve_value(dst, obj, solution: dict[_TypeParameter, tp.Any], /) -> bool:
     return whether obj is an instance of dst.
     """
     if not _free_params(dst):
-        return isinstance(obj, subtype(dst))
+        return isinstance_(obj, subtype(dst))
     if (tp.get_origin(dst) or dst) is collections.abc.Callable:
         if not callable(obj):
             return False
@@ -1415,7 +1420,7 @@ def _solve_value(dst, obj, solution: dict[_TypeParameter, tp.Any], /) -> bool:
             _callable_signature(dst),
             sigs,
             solution,
-            self_class=owner if isinstance(owner, type) else type(owner),
+            self_class=owner if isinstance_(owner, type) else type(owner),
         )
     if (src := _infer_type(obj)) is not None:
         ok, bound = _solve_cached(dst, src, frozenset(solution.items()))
@@ -1427,7 +1432,7 @@ def _solve_value(dst, obj, solution: dict[_TypeParameter, tp.Any], /) -> bool:
         if (
             ok
             and params
-            and isinstance(obj, collections.abc.Collection)
+            and isinstance_(obj, collections.abc.Collection)
             and (args := _map_args(dst, collections.abc.Iterable, erased=False))
         ):
             # dst is Iterable and obj is a Collection, so can be walked
@@ -1489,7 +1494,7 @@ def _infer_type(obj, /):
         if ret is sig.empty:
             return
         if ret is tp.Self:
-            if not isinstance(func, type):
+            if not isinstance_(func, type):
                 return
             type_params, _ = _generic_bases(func)
             ret = types.GenericAlias(func, type_params) if type_params else func
@@ -1506,7 +1511,7 @@ class _generic_instancecheck(_checker):
         )
 
     def __call__(self, obj, /, **ctx):
-        if not _probe(isinstance, obj, self.__form__.__origin__):
+        if not _probe(isinstance_, obj, self.__form__.__origin__):
             return False
         # _assign_generic only sees type(obj), whose __call__ is type.__call__
         # for a class and FunctionType.__call__ for a function
@@ -1539,7 +1544,7 @@ class _generic_instancecheck(_checker):
                     for s in getitem
                 )
             ]
-            d = obj if isinstance(obj, collections.abc.Mapping) else {**obj}
+            d = obj if isinstance_(obj, collections.abc.Mapping) else {**obj}
             return all(
                 subtype(collections.abc.Collection[t]).__subtype_instancecheck__(
                     xs, **ctx
@@ -1560,7 +1565,7 @@ class _generic_instancecheck(_checker):
             )
         ]:
             item = subtype(tp.Union[*rets])
-        elif isinstance(obj, collections.abc.Collection) and (
+        elif isinstance_(obj, collections.abc.Collection) and (
             args := _map_args(self.__form__, collections.abc.Iterable, erased=False)
         ):
             [item] = map(subtype, args.values())
@@ -1609,7 +1614,7 @@ class _type_instancecheck(_checker):
         self.__form__ = subtype(arg)
 
     def __call__(self, obj, /, **ctx):
-        return isinstance(obj, type) and _assign_type(self.__form__, obj, **ctx)
+        return isinstance_(obj, type) and _assign_type(self.__form__, obj, **ctx)
 
 
 class _type_subclasscheck(_type_instancecheck):
@@ -1617,7 +1622,7 @@ class _type_subclasscheck(_type_instancecheck):
         origin = tp.get_origin(obj) or obj
         if origin is builtins.type:
             [arg] = tp.get_args(obj) or [tp.Any]
-        elif isinstance(origin, type) and issubclass(origin, builtins.type):
+        elif isinstance_(origin, type) and issubclass(origin, builtins.type):
             arg = object
         else:
             return False
@@ -1654,7 +1659,7 @@ class subtype(type):
     @tp.no_type_check
     @staticmethod
     def __new__(mcls, typx, /):
-        if isinstance(typx, mcls):
+        if isinstance_(typx, mcls):
             if type(typx) is mcls:
                 return typx
             typx = typx.__subtype_form__
@@ -1774,7 +1779,7 @@ class subtype(type):
         raise TypeError(f"cannot instantiate {type(cls).__qualname__} objects")
 
     def __or__(cls, other, /):
-        if isinstance(other, mcls := type(cls)):
+        if isinstance_(other, mcls := type(cls)):
             return mcls(cls.__subtype_form__ | other.__subtype_form__)
         try:
             return mcls(cls.__subtype_form__ | other)
@@ -1786,3 +1791,7 @@ class subtype(type):
             return cls.__class__(other | cls.__subtype_form__)
         except NotImplementedError, TypeError:
             return NotImplemented
+
+
+def isinstance(obj: object, typx: tp.Any, /) -> bool:
+    return isinstance_(obj, subtype(typx))
