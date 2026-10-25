@@ -13,6 +13,10 @@ dependencies = [
 ]
 
 [dependency-groups]
+dev = [
+    "black>=26.10.1",
+    "isort>=9.0.2",
+]
 tests = [
     "pytest>=9.1.1",
 ]
